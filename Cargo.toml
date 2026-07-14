@@ -1,0 +1,20 @@
+[package]
+name = "iroh-rdp-tunnel"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal P2P tunnel for Windows RDP (port 3389) built on iroh"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+iroh = "1.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "signal"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
