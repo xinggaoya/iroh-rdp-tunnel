@@ -5,6 +5,13 @@
 //! on `127.0.0.1:3389` and bridges bytes both ways. The connection is QUIC,
 //! end-to-end encrypted — RDP does not need TLS itself.
 //!
+//! Address-publishing trick:
+//!     The default N0 preset only publishes relay URLs via pkarr (to keep
+//!     public IPs private by default). We add a *second* PkarrPublisher with
+//!     `AddrFilter::unfiltered()` so that the server's public IPv6 / IPv4
+//!     addresses get advertised too — letting the client attempt a direct
+//!     connection and skip the relay.
+//!
 //! Usage:
 //!     cargo run --release --bin server
 //!
@@ -13,15 +20,13 @@
 
 use anyhow::Result;
 use iroh::{
-    Endpoint, EndpointId, RelayMode,
-    endpoint::{Connection, presets},
+    Endpoint, EndpointId, RelayMode, TransportAddr,
+    address_lookup::{AddrFilter, PkarrPublisher},
+    endpoint::{Connection, PortmapperConfig, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use iroh_rdp_tunnel::ALPN;
-use tokio::{
-    io::AsyncWriteExt,
-    net::TcpStream,
-};
+use tokio::{io::AsyncWriteExt, net::TcpStream};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -36,18 +41,45 @@ async fn main() -> Result<()> {
     let endpoint_id: EndpointId = secret_key.public();
 
     // Use n0's discovery (DNS pkarr + public relay). Set NO_RELAY=1 to
-    // disable the relay — only useful when both peers are on the same LAN
-    // and you also pass direct IP addresses.
+    // disable the relay entirely; only do this when both peers are on the
+    // same LAN and can reach each other's direct addresses.
     let relay_mode = if std::env::var_os("NO_RELAY").is_some() {
         RelayMode::Disabled
     } else {
         RelayMode::Default
     };
 
+    // OPTIONAL: enable an even more aggressive IPv6-only publish mode.
+    // Set FORCE_IPV6=1 to leak ONLY public IPv6 addresses (skip IPv4 + relay).
+    // Combined with NO_RELAY=1 this forces a pure IPv6 connection when possible.
+    let addrs_filter: AddrFilter = if std::env::var_os("FORCE_IPV6").is_some() {
+        AddrFilter::new(|addrs| {
+            use std::borrow::Cow;
+            Cow::Owned(
+                addrs.iter()
+                    .filter(|a| matches!(a, TransportAddr::Ip(sa) if sa.is_ipv6()))
+                    .cloned()
+                    .collect(),
+            )
+        })
+    } else {
+        // Default: publish everything (public IPv4 + IPv6 + relay URL).
+        // This is the key change that lets direct connections succeed.
+        AddrFilter::unfiltered()
+    };
+
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .relay_mode(relay_mode)
         .alpns(vec![ALPN.to_vec()])
+        // Try UPnP / NAT-PMP / PCP for IPv4 port mapping — does nothing if
+        // the router doesn't support them or the device is already public.
+        .portmapper_config(PortmapperConfig::default())
+        // Add a SECOND PkarrPublisher that overrides the default relay-only
+        // filter. Without this the default n0 preset *never* publishes your
+        // public IPv6 to dns.iroh.link, so the client can never learn your
+        // direct address and is forced to relay-only traffic.
+        .address_lookup(PkarrPublisher::n0_dns().addr_filter(addrs_filter))
         .bind()
         .await?;
 
@@ -55,8 +87,7 @@ async fn main() -> Result<()> {
         .accept(ALPN.to_vec(), BridgeHandler)
         .spawn();
 
-    // Wait until the endpoint is online (DNS announcements finished,
-    // relay reachable).
+    // Block until fully online (DNS announcements finished, relay reachable).
     endpoint.online().await;
 
     println!();
@@ -67,12 +98,23 @@ async fn main() -> Result<()> {
     println!();
     println!("     {}", endpoint_id);
     println!();
-    println!(" (Tip: the server's local RDP must be enabled at 127.0.0.1:3389)");
+    println!(" Server address-filter: ");
+    if std::env::var_os("FORCE_IPV6").is_some() {
+        println!("   FORCE_IPV6=1  → only IPv6 public addresses published");
+    } else {
+        println!("   unfiltered      → IPv4 + IPv6 + relay URL published");
+    }
+    println!(" Relay mode: {}",
+        if std::env::var_os("NO_RELAY").is_some() { "Disabled" } else { "Default (n0)" });
+    println!();
+    println!(" Now watching:");
+    println!("   * Looking for `external_address`  → UPnP/portmapper succeeded");
+    println!("   * Looking for `direct IPv6`        → straight-from-public-IPv6 path");
+    println!("   * Looking for `home is now relay`  → currently on a relay (only)");
+    println!();
     println!(" Waiting for client connection... (Ctrl-C to exit)");
     println!();
 
-    // Block until Ctrl-C, then shut down cleanly.
-    println!("(press Ctrl-C to stop the server)");
     tokio::signal::ctrl_c().await?;
     println!("\nshutting down...");
     router.shutdown().await?;
