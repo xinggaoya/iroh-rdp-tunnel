@@ -8,9 +8,9 @@
 //! Address-publishing trick:
 //!     The default N0 preset only publishes relay URLs via pkarr (to keep
 //!     public IPs private by default). We add a *second* PkarrPublisher with
-//!     `AddrFilter::unfiltered()` so that the server's public IPv6 / IPv4
-//!     addresses get advertised too — letting the client attempt a direct
-//!     connection and skip the relay.
+//!     `AddrFilter::ip_only()` so that the server's public IPv4 (and IPv6 if
+//!     present) addresses get advertised — letting the client attempt a
+//!     direct connection instead of going straight to the relay.
 //!
 //! Usage:
 //!     cargo run --release --bin server
@@ -49,15 +49,16 @@ async fn main() -> Result<()> {
         RelayMode::Default
     };
 
-    // OPTIONAL: filtering modes — useful when (e.g.) the server has no IPv6
-    // at all and iroh keeps trying IPv6 paths that fail with WSAENETUNREACH.
-    //   FORCE_IPV6        — publish ONLY public IPv6
-    //   FORCE_IPV4_ONLY   — publish ONLY public IPv4
-    //   (default, unset)  — publish everything via AddrFilter::unfiltered()
+    // OPTIONAL: filter modes — useful when (e.g.) the server has no IPv6
+    // and iroh keeps trying IPv6 paths that fail with WSAENETUNREACH.
+    //   (default, no env) — publish IP addresses only (v4 + v6), no relay URL
+    //   FORCE_IPV6=1      — publish only IPv6
+    //   FORCE_RELAY=1     — publish everything including the n0 relay URL
     //
-    // FORCE_IPV4_ONLY is the right choice when the server side has no IPv6
-    // routing but does have a working UPnP-mapped public IPv4 — it forces
-    // the client to skip IPv6 attempts that will always fail.
+    // The default (`ip_only()`) is what makes direct connections succeed on
+    // networks that have IPv4 UPnP / public IPv6. We deliberately do NOT
+    // publish the relay URL because that would tempt the client to attempt
+    // relay fallback first instead of trying P2P.
     let addrs_filter: AddrFilter = if std::env::var_os("FORCE_IPV6").is_some() {
         AddrFilter::new(|addrs| {
             use std::borrow::Cow;
@@ -68,20 +69,13 @@ async fn main() -> Result<()> {
                     .collect(),
             )
         })
-    } else if std::env::var_os("FORCE_IPV4_ONLY").is_some() {
-        AddrFilter::new(|addrs| {
-            use std::borrow::Cow;
-            Cow::Owned(
-                addrs.iter()
-                    .filter(|a| matches!(a, TransportAddr::Ip(sa) if sa.is_ipv4()))
-                    .cloned()
-                    .collect(),
-            )
-        })
-    } else {
-        // Default: publish everything (public IPv4 + IPv6 + relay URL).
-        // This is the key change that lets direct connections succeed.
+    } else if std::env::var_os("FORCE_RELAY").is_some() {
         AddrFilter::unfiltered()
+    } else {
+        // Default: publish IP addresses only (both v4 + v6). Anything else
+        // the server actually has available will get advertised automatically.
+        // We deliberately drop the relay URL so the client tries P2P first.
+        AddrFilter::ip_only()
     };
 
     let endpoint = Endpoint::builder(presets::N0)
@@ -134,10 +128,11 @@ async fn main() -> Result<()> {
     println!(" Address-filter: ");
     if std::env::var_os("FORCE_IPV6").is_some() {
         println!("     FORCE_IPV6=1     → only IPv6 public addresses published");
-    } else if std::env::var_os("FORCE_IPV4_ONLY").is_some() {
-        println!("     FORCE_IPV4_ONLY=1 → only IPv4 public addresses published");
+    } else if std::env::var_os("FORCE_RELAY").is_some() {
+        println!("     FORCE_RELAY=1    → all (v4 + v6 + relay URL) published");
     } else {
-        println!("     unfiltered         → IPv4 + IPv6 + relay URL published");
+        println!("     ip_only            → IP addresses only (relay URL NOT published)");
+        println!("                         → forces client to try P2P first");
     }
     println!(" Relay mode: {}",
         if std::env::var_os("NO_RELAY").is_some() { "Disabled" } else { "Default (n0)" });
