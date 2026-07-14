@@ -25,7 +25,7 @@ use iroh::{
     endpoint::{Connection, PortmapperConfig, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
-use iroh_rdp_tunnel::ALPN;
+use iroh_rdp_tunnel::{ALPN, BUILD_TAG};
 use tokio::{io::AsyncWriteExt, net::TcpStream};
 
 #[tokio::main]
@@ -92,17 +92,34 @@ async fn main() -> Result<()> {
 
     println!();
     println!("=========================================================");
-    println!(" iroh-rdp-tunnel SERVER is ready");
+    println!(" iroh-rdp-tunnel SERVER {BUILD_TAG}");
     println!("=========================================================");
     println!(" Copy this endpoint id into the `client` on the other machine:");
     println!();
     println!("     {}", endpoint_id);
     println!();
-    println!(" Server address-filter: ");
-    if std::env::var_os("FORCE_IPV6").is_some() {
-        println!("   FORCE_IPV6=1  → only IPv6 public addresses published");
+
+    // Print every address this endpoint advertises — this is exactly what
+    // the client will be able to dial after it resolves the pkarr record.
+    let info = endpoint.addr();
+    println!(" My addresses (what we publish to DNS):");
+    if info.ip_addrs().count() == 0 {
+        println!("     IP  :  <none — UPnP failed AND no public IPv6 detected>");
+        println!("           → client will be forced into relay-only mode (high latency)");
     } else {
-        println!("   unfiltered      → IPv4 + IPv6 + relay URL published");
+        for ip in info.ip_addrs() {
+            println!("     IP  : {ip}");
+        }
+    }
+    for u in info.relay_urls() {
+        println!("     Relay: {u}");
+    }
+    println!();
+    println!(" Address-filter: ");
+    if std::env::var_os("FORCE_IPV6").is_some() {
+        println!("     FORCE_IPV6=1  → only IPv6 public addresses published");
+    } else {
+        println!("     unfiltered      → IPv4 + IPv6 + relay URL published");
     }
     println!(" Relay mode: {}",
         if std::env::var_os("NO_RELAY").is_some() { "Disabled" } else { "Default (n0)" });
