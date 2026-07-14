@@ -49,15 +49,31 @@ async fn main() -> Result<()> {
         RelayMode::Default
     };
 
-    // OPTIONAL: enable an even more aggressive IPv6-only publish mode.
-    // Set FORCE_IPV6=1 to leak ONLY public IPv6 addresses (skip IPv4 + relay).
-    // Combined with NO_RELAY=1 this forces a pure IPv6 connection when possible.
+    // OPTIONAL: filtering modes — useful when (e.g.) the server has no IPv6
+    // at all and iroh keeps trying IPv6 paths that fail with WSAENETUNREACH.
+    //   FORCE_IPV6        — publish ONLY public IPv6
+    //   FORCE_IPV4_ONLY   — publish ONLY public IPv4
+    //   (default, unset)  — publish everything via AddrFilter::unfiltered()
+    //
+    // FORCE_IPV4_ONLY is the right choice when the server side has no IPv6
+    // routing but does have a working UPnP-mapped public IPv4 — it forces
+    // the client to skip IPv6 attempts that will always fail.
     let addrs_filter: AddrFilter = if std::env::var_os("FORCE_IPV6").is_some() {
         AddrFilter::new(|addrs| {
             use std::borrow::Cow;
             Cow::Owned(
                 addrs.iter()
                     .filter(|a| matches!(a, TransportAddr::Ip(sa) if sa.is_ipv6()))
+                    .cloned()
+                    .collect(),
+            )
+        })
+    } else if std::env::var_os("FORCE_IPV4_ONLY").is_some() {
+        AddrFilter::new(|addrs| {
+            use std::borrow::Cow;
+            Cow::Owned(
+                addrs.iter()
+                    .filter(|a| matches!(a, TransportAddr::Ip(sa) if sa.is_ipv4()))
                     .cloned()
                     .collect(),
             )
@@ -117,9 +133,11 @@ async fn main() -> Result<()> {
     println!();
     println!(" Address-filter: ");
     if std::env::var_os("FORCE_IPV6").is_some() {
-        println!("     FORCE_IPV6=1  → only IPv6 public addresses published");
+        println!("     FORCE_IPV6=1     → only IPv6 public addresses published");
+    } else if std::env::var_os("FORCE_IPV4_ONLY").is_some() {
+        println!("     FORCE_IPV4_ONLY=1 → only IPv4 public addresses published");
     } else {
-        println!("     unfiltered      → IPv4 + IPv6 + relay URL published");
+        println!("     unfiltered         → IPv4 + IPv6 + relay URL published");
     }
     println!(" Relay mode: {}",
         if std::env::var_os("NO_RELAY").is_some() { "Disabled" } else { "Default (n0)" });
