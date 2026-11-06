@@ -1,0 +1,458 @@
+# iroh-rdp-tunnel v0.2 设计文档
+
+> 目标：让本项目在**实测网络画像**下真正做到 P2P 直连优先，并把「直连还是中继」变成**肉眼可见**的运行时指标。
+
+---
+
+## 1. 背景：本机网络画像（实测，非推测）
+
+| 项目 | 实测结果 | 对实现的影响 |
+|---|---|---|
+| 公网 IP | `171.37.192.67`（联通 10G-GPON 光猫 `192.168.1.1`） | 可作为通告端点 |
+| NAT **映射**行为 | **EIM 端点无关映射**（跨 3 个 STUN 一致） | 公网端点稳定 → 可通告、可打洞 |
+| NAT **过滤**行为 | **地址依赖**：未通信来源的入站 UDP 全丢 | **必须双方同时发包** |
+| CGNAT | 无 | 打洞成立的前提条件已满足 |
+| UPnP / NAT-PMP / PCP | **三者全不支持** | 端口映射不可依赖，但 EIM 下不需要 |
+| IPv6 | 无全局地址（仅 `fe80::`） | 只走 IPv4 |
+| 延迟 | 国内 37ms / 0 丢包 | 直连体验远好于中继 |
+| Windows 防火墙 | node.exe 等**无入站放行规则** | 远控程序必须自行放行 |
+| RDP | 已开启，监听 3389 | 可直接用 |
+
+**核心结论**：网络本身**支持 P2P**，但**不是「任意入站」模式**，必须走「**双方同时发包**」的打洞。
+
+---
+
+## 2. 机制澄清：iroh 的打洞是怎么工作的
+
+对照 `iroh 1.0.2` 源码逐条核对：
+
+| 事实 | 源码位置 | 含义 |
+|---|---|---|
+| 打洞基于 QUIC NAT Traversal 扩展 | `endpoint/quic.rs:528`（`max_remote_nat_traversal_addresses`） | 候选地址在**已建立的 QUIC 连接**上交换 |
+| 打洞触发点 = 连接建立之后 | `socket/remote_map/remote_state.rs:917` `do_holepunching()` | **先建连，才能打洞** |
+| 打洞 = 双方同时发包 | `conn.initiate_nat_traversal_round()` → 双方各自向对方候选地址发包 | 与实测结论完全一致 |
+| relay 路径必须来自**对端公布的 RelayUrl** | `remote_state.rs:1514` `TransportAddr::Relay(url) => Addr::from((url, endpoint_id))` | **不公布 relay URL ⇒ 客户端建不出 relay 路径** |
+| 直连优先于中继 | `socket/biased_rtt_path_selector.rs:94`：IPv4/IPv6 = primary 层，Relay = backup 层，跨层立即切换 | 公布 relay URL **不会**导致「一直走中继」 |
+
+### 2.1 当前代码的一个致命缺陷
+
+`server.rs` 现在默认 `AddrFilter::ip_only()` —— 它把 relay URL 从 pkarr 记录里剔掉了。后果链条：
+
+```
+ip_only() 剔除 relay URL
+  → 客户端 DNS 解析不到对端 RelayUrl
+  → iroh 建不出 relay 路径（remote_state.rs:1514）
+  → 客户端只能直连 171.37.192.67:34622
+  → 被光猫「地址依赖过滤」丢弃（未通信来源的入站 UDP 全丢）
+  → 连接直接失败；且没有通道交换打洞候选，打洞也无从谈起
+```
+
+上个 commit 写的「iroh 会用自己的 relay 兜底」**不成立**。这也解释了此前观察到的 360ms 中继延迟：那是 `unfiltered()`（relay URL 有公布）时的回落行为。
+
+### 2.2 正确模型
+
+```
+server 公布 relay URL（iroh 标准：AddrFilter::relay_only）
+  → 客户端经 relay 建连（必定成功）
+  → 已建立的连接上交换 NAT 候选地址
+  → 双方同时发包 → 打洞成功 → iroh 立即切到直连路径（primary 层）
+  → 之后全程直连，中继只做兜底
+```
+
+**这正是「双方同时发包」打洞模式，iroh 原生就实现了，不需要自己造。**
+
+---
+
+## 3. 设计决策
+
+| # | 决策 | 理由 | 备选与否决理由 |
+|---|---|---|---|
+| D1 | **默认发布策略改为 `relay-only`** | §2.2；地址依赖过滤下唯一能保证建连的方式 | `ip-only` 已证实建不上；`all` 会让客户端先试直连、首包多等一个超时 |
+| D2 | **新增「直连/中继 + RTT」实时指示** | 用户唯一需要的验收信号就是「看客户端显示直连还是中继」 | 只在文档里写没用，必须运行时可观测 |
+| D3 | **endpoint id 持久化** | 现在 `SecretKey::generate()` 每次启动都变 id，复制粘贴成本高、无法写进脚本 | 固定 id 后可直接配防火墙/端口转发/收藏 |
+| D4 | **内置 `diag` 网络体检** | 把 `netdiag/*.js` 的结论固化成工具，换网络环境时能自证 | 依赖外部 node 脚本不可持续 |
+| D5 | **Windows 防火墙规则内置** | 实测 node.exe 都无入站放行；不放行必退化成中继甚至连不上 | 只在 README 写「记得放行」不够可靠 |
+| D6 | **client 复用单条 QUIC 连接** | 现在每个 mstsc TCP 连接都新建一条 QUIC 连接 → 每次重打洞；改为常驻连接后打洞只发生一次 | 保持每连接新建会反复触发打洞，首帧延迟高 |
+| D7 | **保留 `NO_RELAY` / `FORCE_RELAY` / `FORCE_IPV6` 旧环境变量** | 不破坏用户现有习惯 | 旧的 `FORCE_IPV4_ONLY` 从未真正生效过，一并清理 |
+| D8 | **单一 `irt` 入口，三个子命令** | 只有一个 exe 要分发；子命令让「server / client / diag」在同一套配置层上；`bin/` 退化为薄壳，业务逻辑全部可单测 | 原设计的三个独立二进制（server/client/diag）—— 评审决定合并 |
+| D9 | **用 `presets::Minimal` 自行组装 Endpoint，不用 `presets::N0` + 追加 publisher** | `presets::N0` 内部已注册 `PkarrPublisher::n0_dns()`（默认 `relay_only`），再追加第二个会让**同一 endpoint id 在 pkarr 上出现两条竞态记录**，发布内容不确定 | 沿用现有 `server.rs` 的 `presets::N0` + 第二个 publisher 写法 —— 实施计划阶段核对源码发现的问题 |
+
+---
+
+## 4. 架构：模块划分
+
+```
+src/
+├── lib.rs           crate 根：pub mod 声明、公共类型再导出
+├── cli.rs           clap 定义：顶层 Args + 三个子命令 + run() 入口
+├── config.rs        配置层：CLI + 环境变量 → 强类型配置
+├── keys.rs          密钥持久化：load_or_create_secret_key()
+├── addrpolicy.rs    发布策略：PublishPolicy → AddrFilter 映射
+├── nat.rs           NAT 画像：net_report 解析 → NatProfile + 判定
+├── portmap.rs       端口映射探测：UPnP / NAT-PMP / PCP 可用性
+├── pathinfo.rs      路径可观测：PathKind / describe_path / spawn_path_monitor
+├── tunnel.rs        隧道核心：TCP ↔ QUIC stream 双向桥接（两端共用）
+├── connmgr.rs       client 侧常驻连接管理器（自动重连）
+├── fw.rs            Windows 防火墙规则安装/卸载
+├── diag.rs          网络体检报告组装与渲染
+├── commands/        子命令实现（纯逻辑，可被单测直接调用）
+│   ├── mod.rs
+│   ├── server.rs    被控端
+│   ├── client.rs    控制端
+│   └── diag.rs      网络体检
+└── bin/
+    └── irt.rs       薄壳：main() → iroh_rdp_tunnel::cli::run()
+```
+
+### 4.1 依赖方向
+
+```
+bin/irt.rs  ──►  cli ──► commands/{server,client,diag}
+                                │
+                                ├──► config ──► keys / addrpolicy
+                                │                │
+                                │                └──► nat ──► portmap
+                                │
+                                ├──► tunnel ◄──── connmgr
+                                └──► pathinfo / fw
+```
+
+`lib.rs` 只做聚合与再导出，不含逻辑。**任何模块不得反向依赖 `bin/`**；
+`commands/*` 只依赖 `lib` 内的其它模块，可被集成测试直接调用。
+
+---
+
+## 5. 关键类型与函数契约
+
+### 5.1 `config.rs`
+
+```rust
+/// 对外公布哪些地址。默认 RelayOnly（iroh 标准模型）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishPolicy {
+    /// 只公布 relay URL —— 保证建连 + 打洞迁移（默认）
+    RelayOnly,
+    /// 只公布公网 IP —— 需要对端做端口转发/静态映射时用
+    IpOnly,
+    /// relay + IP 全公布
+    All,
+}
+
+impl PublishPolicy {
+    /// 解析 CLI 值 / 环境变量值
+    pub fn parse(s: &str) -> Option<Self>;
+    /// 映射到 iroh 的地址过滤器
+    pub fn to_addr_filter(self) -> AddrFilter;
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    pub key_file: PathBuf,          // 默认 %APPDATA%\iroh-rdp-tunnel\server.key
+    pub rdp_target: SocketAddr,     // 默认 127.0.0.1:3389
+    pub publish: PublishPolicy,     // 默认 RelayOnly
+    pub relay_mode: RelayMode,      // 默认 Default；NO_RELAY=1 → Disabled
+    pub allow_list: Vec<EndpointId>,// 空 = 不限制
+    pub listen_v6: bool,            // 默认 false（本机无 IPv6 全局地址）
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientConfig {
+    pub remote: EndpointId,
+    pub listen: SocketAddr,         // 默认 127.0.0.1:13389
+    pub relay_mode: RelayMode,
+}
+```
+
+配置优先级：**CLI 参数 > 环境变量 > 默认值**。
+
+| 环境变量 | 等价 CLI | 说明 |
+|---|---|---|
+| `IRT_PUBLISH` | `--publish relay\|ip\|all` | 发布策略 |
+| `IRT_KEY_FILE` | `--key-file` | 密钥路径 |
+| `IRT_RDP` | `--rdp` | 被控端本地 RDP 地址 |
+| `IRT_LISTEN` | `--listen` | 控制端本地监听 |
+| `IRT_RELAY` | `--relay <url>` | 自建 relay（可重复） |
+| `NO_RELAY` | `--no-relay` | 完全禁用 relay（旧名保留） |
+| `IRT_ALLOW` | `--allow <id>` | 白名单（可重复，旧名保留） |
+
+### 5.2 `keys.rs`
+
+```rust
+/// 读取密钥文件；不存在则原子创建（先写临时文件再 rename）。
+/// 文件内容为 32 字节原始私钥；权限尽力设为 0600（Windows 跳过）。
+pub fn load_or_create_secret_key(path: &Path) -> anyhow::Result<SecretKey>;
+
+/// 把 endpoint id 以十六进制写一份同名 `.txt` 便于复制（best-effort）。
+pub fn write_endpoint_id_hint(path: &Path, id: EndpointId) -> anyhow::Result<()>;
+```
+
+### 5.3 `nat.rs`
+
+```rust
+/// NAT 映射行为分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MappingBehavior {
+    /// 端点无关映射（EIM）：公网端点稳定 —— 打洞有利
+    EndpointIndependent,
+    /// 对称 NAT：映射随目标变化 —— 通告端点对不上号，打洞必败
+    Symmetric,
+    /// 无法判定
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct NatProfile {
+    pub global_v4: Option<SocketAddrV4>,
+    pub global_v6: Option<SocketAddrV6>,
+    pub mapping: MappingBehavior,
+    pub udp_v4: bool,
+    pub udp_v6: bool,
+    pub captive_portal: Option<bool>,
+    pub preferred_relay: Option<RelayUrl>,
+    pub relay_latencies: Vec<(RelayUrl, Duration)>,
+    pub port_mapping: PortMappingStatus,
+}
+
+/// 从 iroh 的 net_report 解析 NAT 画像。
+pub fn profile_from_report(report: &NetReport, pm: PortMappingStatus) -> NatProfile;
+
+/// 给出「是否预期能 P2P 直连」的判定与理由。
+pub fn verdict(profile: &NatProfile) -> Verdict;
+```
+
+判定逻辑：
+
+| 条件 | 结论 |
+|---|---|
+| `mapping == Symmetric` | ❌ 直连不可行，只能中继 |
+| `mapping == EndpointIndependent` | ✅ 直连可行（打洞走双方同时发包，不依赖放行任意入站） |
+| `mapping == Unknown` | ⚠️ 未知，建议先跑 `diag` |
+
+> **诚实边界**：iroh 的 net_report **只能测映射行为，不能测过滤行为**。「地址依赖过滤」这一项无法由 iroh 直接测量，`diag` 会明确标注「未测量」并指向 `netdiag/filter-proof.js` 做严格验证——不会假装测到了。
+
+### 5.4 `portmap.rs`
+
+```rust
+pub enum PortMappingStatus {
+    /// 三种协议均不可用（本机光猫实测如此）
+    Unsupported,
+    /// 部分可用
+    Partial { upnp: bool, nat_pmp: bool, pcp: bool },
+    /// 已成功建立映射
+    Mapped { external: SocketAddrV4 },
+    /// 探测失败
+    ProbeFailed(String),
+}
+
+/// 独立跑一次 UPnP / NAT-PMP / PCP 探测（用 portmapper crate）。
+pub async fn probe() -> PortMappingStatus;
+```
+
+### 5.5 `pathinfo.rs`
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathKind {
+    /// 直连 IP 路径
+    Direct,
+    /// 经中继转发
+    Relay,
+}
+
+/// 当前选中的路径快照。
+#[derive(Debug, Clone)]
+pub struct PathInfo {
+    pub kind: PathKind,
+    pub remote: String,            // "171.37.192.67:34622" 或 relay url
+    pub rtt: Option<Duration>,
+}
+
+/// 读取连接当前选中的路径。
+pub fn describe_path(conn: &Connection) -> Option<PathInfo>;
+
+/// 订阅路径事件，路径切换时回调（用于「✅ 已切换到直连」提示）。
+pub fn spawn_path_monitor(conn: Connection, on_change: impl Fn(PathInfo) + Send + 'static);
+```
+
+### 5.6 `tunnel.rs`（两端共用）
+
+```rust
+/// server 侧：QUIC stream ↔ 本地 TCP。
+pub async fn bridge_quic_to_tcp(
+    send: iroh::endpoint::SendStream,
+    recv: iroh::endpoint::RecvStream,
+    tcp: tokio::net::TcpStream,
+);
+
+/// client 侧：本地 TCP ↔ QUIC stream。
+pub async fn bridge_tcp_to_quic(
+    local: tokio::net::TcpStream,
+    send: iroh::endpoint::SendStream,
+    recv: iroh::endpoint::RecvStream,
+);
+```
+
+两函数共享一份双向拷贝 + 半关闭（half-close）收尾逻辑，抽成内部 `pump()`。
+
+### 5.7 `connmgr.rs`（client 侧）
+
+```rust
+/// 维护一条到远端的常驻 QUIC 连接，断线自动重连。
+pub struct ConnManager {
+    remote: EndpointId,
+    endpoint: Endpoint,
+    conn_rx: tokio::sync::watch::Receiver<Option<Connection>>,
+}
+
+impl ConnManager {
+    /// 启动后台任务：连接 → 断开 → 退避重连。
+    pub fn start(endpoint: Endpoint, remote: EndpointId) -> Self;
+    /// 取当前可用连接；没有则等待（最多 timeout）。
+    pub async fn connection(&self, timeout: Duration) -> anyhow::Result<Connection>;
+}
+```
+
+### 5.8 `fw.rs`
+
+```rust
+/// 为指定可执行文件添加 Windows 防火墙入站 UDP 放行规则。
+pub fn install_udp_allow_rule(exe: &Path, rule_name: &str) -> anyhow::Result<()>;
+/// 删除规则。
+pub fn remove_rule(rule_name: &str) -> anyhow::Result<()>;
+/// 检测当前 exe 是否已有放行规则。
+pub fn has_allow_rule(exe: &Path, rule_name: &str) -> bool;
+```
+
+非 Windows 平台返回「不适用」错误，不 panic。
+
+---
+
+## 6. CLI 契约
+
+单一 `irt` 可执行文件，三个子命令：
+
+```
+irt server [--publish relay|ip|all] [--key-file PATH] [--rdp ADDR]
+            [--no-relay] [--relay URL]... [--allow ID]...
+            [--install-firewall-rule] [--uninstall-firewall-rule]
+
+irt client <ENDPOINT_ID> [--listen ADDR] [--no-relay] [--relay URL]...
+
+irt diag [--json]
+```
+
+分发时只有一个 `irt.exe`（Windows）或 `irt`（Linux/macOS）需要拷贝。
+子命令定义集中在 `cli.rs`，实现集中在 `commands/*`，`bin/irt.rs` 仅 10 行左右。
+
+---
+
+## 7. 运行时输出样例
+
+### 7.1 server 启动
+
+```
+=========================================================
+ iroh-rdp-tunnel SERVER  (build v0.2.0)
+=========================================================
+ endpoint id   : 86e9c0158a1f097baf3b17ce917501f5e4e3c244cf9cf57f39dcb187e9e09440
+ 密钥文件      : C:\Users\10322\AppData\Roaming\iroh-rdp-tunnel\server.key
+ 发布策略      : relay-only   (经中继建连后双方同时打洞，自动迁移直连)
+ home relay    : https://aps1-1.relay.n0.iroh.link./
+ 本机公网端点  : 171.37.192.67:34622   (EIM 映射 · 端点稳定)
+ RDP 目标      : 127.0.0.1:3389
+ 防火墙        : ⚠ 未检测到入站 UDP 放行规则
+                → 请以管理员执行:  irt server --install-firewall-rule
+ 等待客户端连接…  (Ctrl-C 退出)
+```
+
+### 7.2 client 连接（关键验收信号）
+
+```
+=========================================================
+ iroh-rdp-tunnel CLIENT  (build v0.2.0)
+=========================================================
+ 远端 endpoint : 86e9c015…09440
+ 本地 TCP 监听 : 127.0.0.1:13389
+
+ 正在与远端建立连接…
+   [路径] 中继 https://aps1-1.relay.n0.iroh.link./  RTT 41ms
+   [路径] ✅ 已切换到直连  171.37.192.67:34622  RTT 37ms
+ =========================================================
+ 打开 mstsc 连接: 127.0.0.1:13389
+```
+
+### 7.3 `diag`
+
+```
+=========================================================
+ iroh-rdp-tunnel 网络体检
+=========================================================
+ 公网 IPv4 端点   : 171.37.192.67:34622
+ NAT 映射行为     : 端点无关映射 (EIM)  ✅ 公网端点稳定，可通告
+ NAT 过滤行为     : 未测量（iroh 无法直接探测；严格验证见 netdiag/filter-proof.js）
+ UDP 可用         : IPv4 ✅   IPv6 ❌（无全局地址）
+ 端口映射         : UPnP ❌  NAT-PMP ❌  PCP ❌（不支持）
+                   → 不影响：EIM 映射下内端口固定即端点稳定，打洞不依赖端口映射
+ 最近中继         : aps1-1.relay.n0.iroh.link.  41ms
+                   （未选中 aps1-1 时说明探测未完成，可加 --relay 手动指定）
+
+ 判定: ✅ 具备 P2P 直连条件
+   · 映射为 EIM ⇒ 通告的公网端点稳定，对端能对上号
+   · iroh 的打洞走「双方同时发包」，不需要 NAT 放行任意来源入站
+   · 你的「地址依赖过滤」不会阻断打洞
+   · 无 UPnP 不影响（仅损失「首包更快」的机会）
+ 建议:
+   1. server 保持默认 --publish relay
+   2. 管理员执行 irt server --install-firewall-rule
+   3. 连接后看 client 输出是否出现「✅ 已切换到直连」
+=========================================================
+```
+
+---
+
+## 8. 测试策略
+
+| 层级 | 范围 | 手段 |
+|---|---|---|
+| 单元 | `config` 解析优先级、`keys` 往返、`PublishPolicy→AddrFilter`、`MappingBehavior` 判定文案、`PathInfo` 分类 | `cargo test`，纯函数无 IO |
+| 集成 | 真实 iroh 端到端：进程内 relay（`iroh::test_utils::run_relay_server()`）+ server + client + 内存 TCP 回环 | `tests/e2e.rs`，dev-dependency 开 `iroh/test-utils` |
+| 手工 | 真实公网 P2P 直连验证 | 手机 4G/5G 或境外主机连 client，观察「✅ 已切换到直连」 |
+
+集成测试要点：
+1. 用进程内 relay 替代 n0 公网 relay，测试不依赖外网；
+2. server 用 `NO_RELAY` 之外的方式指定自建 relay（`--relay` / `RelayMode::custom`）；
+3. 断言：随机字节经 TCP → QUIC → TCP 后**逐字节一致**（RDP 协议对完整性敏感）；
+4. 断言：连接建立后 `describe_path()` 返回 `Some(_)`，路径类型可判定。
+
+---
+
+## 9. 风险与回退
+
+| 风险 | 影响 | 缓解 |
+|---|---|---|
+| 改了发布策略后仍走中继 | 延迟 40ms → 200ms+ | 运行时明确打印路径类型；`--publish all` 可强制先试直连；对比测试 |
+| Windows 防火墙规则依赖管理员 | 规则装不上 | 启动时检测并给出**可直接复制粘贴**的命令行 |
+| `iroh` 升级破坏 API | 编译失败 | 锁定 `iroh = "1.0"`（`Cargo.lock` 已锁 1.0.2）；`unstable-net-report` 为 feature，可随时摘掉 |
+| `portmapper` 额外依赖 | 编译时间/体积 | 已是 iroh 传递依赖，不新增下载；探测失败降级为「未知」不报错 |
+| 单一入口破坏旧的 `server.exe`/`client.exe` 用法 | 老脚本失效 | README 顶部给出迁移说明；旧环境变量继续生效 |
+
+---
+
+## 10. 实施顺序
+
+1. **M1 骨架**：模块划分 + `cli`（单一 `irt` 入口 + 三子命令）+ `config` / `keys` / `addrpolicy` + 单元测试
+2. **M2 连通性**：发布策略改 relay-only + server 持久化 id + client 常驻连接（`connmgr`）+ `tunnel` 抽取
+3. **M3 可观测**：`pathinfo` + server/client 双端路径打印（直连/中继 + RTT + 迁移提示）
+4. **M4 防火墙**：`fw` + `--install-firewall-rule` + 启动自检提示
+5. **M5 体检**：`nat` + `portmap` + `irt diag` + JSON 输出
+6. **M6 文档**：README 重写（实测网络画像 / 机制说明 / 排障决策树）+ DESIGN 同步
+7. **M7 验证**：`cargo test` + 集成测试 + 真实公网 P2P 验收
+
+---
+
+## 11. 非目标（本次不做）
+
+- 自建 relay / ID 服务器（iroh 已提供 n0 公共 relay；自建方案在 README 里给出配置方法即可）
+- Windows 服务化 / 开机自启
+- 多客户端并发授权、屏幕录制、文件传输
+- IPv6 直连优化（本机无 IPv6 全局地址）
