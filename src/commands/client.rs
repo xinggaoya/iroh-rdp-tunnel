@@ -58,6 +58,17 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
     println!(" 本机 endpoint : {local_id}");
     println!("                 （可写进被控端的 --allow 白名单）");
     println!(" 本地 TCP 监听 : {}", cfg.listen);
+    // 防火墙状态 —— 打洞要**双向**，服务端打向本机的入站 UDP 会被本机防火墙拦掉。
+    // 这是最容易被忽略的一环（控制端经常只顾着在被控端装规则）。
+    let fw_status = match crate::fw::current_exe() {
+        Ok(exe) => crate::fw::status(&exe),
+        Err(_) => crate::fw::FirewallStatus::Unknown,
+    };
+    println!(" 防火墙        : {}", crate::fw::status_hint(fw_status));
+    if !matches!(fw_status, crate::fw::FirewallStatus::Allowed) {
+        println!("                 ⚠ 打洞需要**本机**放行入站 UDP！");
+        println!("                   请以管理员身份执行: irt.exe client --install-firewall-rule");
+    }
     println!();
     println!(" 正在与远端建立连接…");
     println!();
@@ -76,7 +87,12 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
         tokio::spawn(async move {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(30), endpoint.online()).await;
             if let Some(url) = crate::pathinfo::home_relay(&endpoint) {
-                println!(" 本端中继      : {url}");
+                let host = url
+                    .split("//")
+                    .nth(1)
+                    .unwrap_or(&url)
+                    .trim_end_matches(['/', '.']);
+                println!(" 本端中继域名  : {host}");
                 println!("                 （与被控端的中继**保持一致**可避免中继间转发）");
             }
         });

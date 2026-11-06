@@ -227,10 +227,13 @@ fn print_banner_network(endpoint: &Endpoint, endpoint_id: EndpointId) {
 
     let relays: Vec<_> = addr.relay_urls().collect();
     if relays.is_empty() {
-        println!(" 中继          : ⚠ 未连上任何 relay（客户端将无法建连）");
+        println!(" 中继域名      : ⚠ 未连上任何 relay（客户端将无法建连）");
     } else {
         for u in &relays {
-            println!(" 中继          : {u}");
+            // 域名单独一行，便于一眼看清 / 核对两端用的是不是同一个。
+            let host = u.host_str().unwrap_or("").trim_end_matches('.');
+            println!(" 中继域名      : {host}");
+            println!(" 中继 URL      : {u}");
         }
     }
 
@@ -262,8 +265,11 @@ fn print_banner_network(endpoint: &Endpoint, endpoint_id: EndpointId) {
     // 让用户直接复制这一行，就不可能漏掉 --relay。
     if let Some(relay) = relays.first() {
         println!();
-        println!(" 客户端请执行（**必须带同样的 relay**，否则会多一跳中继转发）:");
+        println!(" ╔══════════════════════════════════════════════════════╗");
+        println!(" ║  控制端请直接复制下面这一行（--relay 必须与本机一致）  ║");
+        println!(" ╚══════════════════════════════════════════════════════╝");
         println!("   irt client {endpoint_id} --relay {relay}");
+        println!();
     }
 }
 

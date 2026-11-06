@@ -20,6 +20,9 @@ use crate::netaddr::{is_global_v4, is_global_v6};
 /// 直连观察窗口：连接建立后多久还没出现直连路径，就提示当前走中继。
 pub const DIRECT_WAIT_WINDOW: Duration = Duration::from_secs(30);
 
+/// 中继一致性检查间隔。
+pub const RELAY_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
 /// 判断一个传输地址是否是**公网**端点（而非私网 / 回环 / 链路本地）。
 ///
 /// 路径事件里会同时冒出本机各张虚拟网卡的私网地址，那些开关纯属噪音；
@@ -194,26 +197,48 @@ pub fn transition_label(prev: Option<PathKind>, now: PathKind) -> &'static str {
     }
 }
 
-/// 若路径用的中继与本端 home relay 不一致，打印告警。
+/// 若路径用的中继与本端 home relay 不一致，打印告警（只报一次）。
 ///
 /// 两端各自自动选 relay 时经常选到不同家 —— 流量要先到本端的中继，
 /// 再由它转发到对端的中继（多一跳），延迟直接叠加。
-fn warn_relay_mismatch(endpoint: &Endpoint, tag: &str, info: &PathInfo) {
-    if info.kind != PathKind::Relay {
-        return;
+///
+/// 注意：路径事件发生的瞬间，本端**可能还没连上 relay**（home relay 为空），
+/// 那时无法判定。所以除了事件驱动，还要靠周期检查补上。
+///
+/// 返回 true 表示已经报过警（不再重复打印）。
+fn check_relay_mismatch_once(
+    endpoint: &Endpoint,
+    tag: &str,
+    conn: &Connection,
+    reported: &std::sync::atomic::AtomicBool,
+) -> bool {
+    if reported.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
     }
-    let home = home_relay(endpoint);
-    if relay_mismatch(&info.remote, home.as_deref()) {
+    let Some(info) = describe_path(conn) else {
+        return false;
+    };
+    if info.kind != PathKind::Relay {
+        return false;
+    }
+    let Some(home) = home_relay(endpoint) else {
+        // 本端还没连上 relay，判不了。
+        return false;
+    };
+    if relay_mismatch(&info.remote, Some(&home)) {
+        reported.store(true, std::sync::atomic::Ordering::Relaxed);
         println!(
-            " [路径·{tag}] ⚠ 路径经由 {} 中转，但本端连的是 {} —— 多了一跳中继转发",
-            info.remote,
-            home.as_deref().unwrap_or("?")
+            " [路径·{tag}] ⚠ 路径经由 {} 中转，但本端连的是 {home} —— 多了一跳中继转发",
+            info.remote
         );
         // 给出的必须是**对端正在用的那个** relay —— 直接抄进命令行就能对齐。
         println!(
             " [路径·{tag}]   ↳ 在本端加上这个参数即可对齐（对端正在用它）：--relay {}",
             info.remote
         );
+        true
+    } else {
+        false
     }
 }
 
@@ -243,10 +268,16 @@ pub fn spawn_path_reporter(
     let mut events = conn.path_events();
     let saw_direct = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let saw_direct2 = Arc::clone(&saw_direct);
+    // 中继不一致只报一次，事件驱动与周期检查共用这个标志。
+    let relay_reported = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let relay_reported2 = Arc::clone(&relay_reported);
+    // 事件循环与周期检查都要用 conn / endpoint，这里先备一份克隆。
+    let conn_for_check = conn.clone();
+    let endpoint_for_check = endpoint.clone();
     let handle = tokio::spawn(async move {
         if let Some(info) = describe_path(&conn) {
             report(&last2, &tag_events, &info);
-            warn_relay_mismatch(&endpoint, &tag_events, &info);
+            check_relay_mismatch_once(&endpoint, &tag_events, &conn, &relay_reported2);
         }
         while let Some(event) = events.next().await {
             match event {
@@ -263,7 +294,7 @@ pub fn spawn_path_reporter(
                             saw_direct2.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                         report(&last2, &tag_events, &info);
-                        warn_relay_mismatch(&endpoint, &tag_events, &info);
+                        check_relay_mismatch_once(&endpoint, &tag_events, &conn, &relay_reported2);
                     }
                 }
                 PathEvent::Closed { remote_addr, .. } => {
@@ -298,6 +329,25 @@ pub fn spawn_path_reporter(
             );
         }
     });
+
+    // 周期检查中继一致性。
+    //
+    // 路径事件发生的瞬间本端可能还没连上 relay（home relay 为空），判不出来；
+    // 只靠事件驱动会漏报。这里每隔几秒补查一次，报过就不再重复。
+    {
+        let conn = conn_for_check;
+        let endpoint = endpoint_for_check;
+        let tag3 = tag.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(RELAY_CHECK_INTERVAL).await;
+                if check_relay_mismatch_once(&endpoint, &tag3, &conn, &relay_reported) {
+                    // 已经报过警，停止周期检查。
+                    return;
+                }
+            }
+        });
+    }
 
     handle
 }
