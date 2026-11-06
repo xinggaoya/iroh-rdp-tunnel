@@ -279,3 +279,71 @@ async fn rustp2p_slow_reader_exercises_backpressure() {
     assert_eq!(got, payload, "字节必须逐字节一致");
     assert_eq!(server_task.await.unwrap(), expect_len);
 }
+
+/// 并发开流到**同一个对端** —— 专门盯住 rustp2p-quic 的虚拟地址竞态。
+///
+/// `rustp2p-quic` 的 `open_bi` 内部：握手失败会把 `virtual_by_peer[peer]` 与
+/// `virtual_by_addr[addr]` **一起删掉**，但缓存里的 `connections[peer]` 仍指向
+/// 旧地址。下一次 `register_virtual_peer` 会分配**新**地址，而
+/// `connection_to_at` 命中缓存返回**旧**连接 ⇒ quinn 往一个已注销的地址发包 ⇒
+/// `unknown synthetic QUIC destination`，且**永远恢复不了**。
+///
+/// 触发条件是**并发** `open_bi`（每个本地 TCP 连接都会开一个流）。
+#[tokio::test]
+async fn rustp2p_concurrent_streams_to_same_peer() {
+    let (server, client) = spawn_topology().await;
+
+    // server 侧：接受多条流并回显。
+    let server_task = tokio::spawn(async move {
+        for _ in 0..8 {
+            let accepted = match server.accept_stream().await {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            tokio::spawn(async move {
+                let mut stream = accepted.stream;
+                let mut buf = vec![0u8; 16 * 1024];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    if stream.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+
+    // client 侧：**同时**开 8 条流到同一个对端。
+    let payload: Vec<u8> = (0..8 * 1024).map(|i| (i % 251) as u8).collect();
+    let expect_len = payload.len();
+    let peer = PeerRef::Rustp2p("server".to_string());
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let client = client.clone();
+        let peer = peer.clone();
+        let payload = payload.clone();
+        handles.push(tokio::spawn(async move {
+            let mut stream = client.open_stream(&peer).await.expect("应能打开双向流");
+            stream.write_all(&payload).await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut got = Vec::new();
+            stream.read_to_end(&mut got).await.unwrap();
+            got
+        }));
+    }
+
+    for h in handles {
+        let got = h.await.expect("并发开流的任务不应 panic");
+        assert_eq!(
+            got.len(),
+            expect_len,
+            "并发开流时字节数必须一致 —— 少字节说明虚拟地址竞态导致流被打断"
+        );
+        assert_eq!(got, payload, "字节必须逐字节一致");
+    }
+    server_task.abort();
+}

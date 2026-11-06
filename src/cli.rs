@@ -75,6 +75,16 @@ pub struct ServerArgs {
     ///
     /// **只是字符串比对，不是身份认证** —— rustp2p 的 peer id 是任意字符串，
     /// 证书校验又被降级为跳过。
+    ///
+    /// ⚠️ **对端必须用 `--node-id` 固定 peer id，否则一定匹配不上。**
+    /// 对端的 peer id 默认随机生成，而本白名单是**逐字比对**的。
+    /// 更糟的是：rustp2p-quic 只有在白名单命中时才会回复 `PunchReply`，
+    /// 而对端正是靠这个 `PunchReply` 确认直连路由 ⇒
+    /// **不命中 ⇒ 直连永远建不起来 ⇒ QUIC 握手 100% 超时**。
+    ///
+    /// ⇒ 被控端拿不到确定的控制端 peer id 时，**不要写这个参数**。
+    /// 打洞收敛由**控制端**负责（它会自动只对目标 peer 打洞）。
+    /// 详见 `docs/deploy/rustp2p-node-vps.md` §3.4 与 DESIGN.md D30。
     #[arg(long = "allow-peer", value_name = "ID")]
     pub allow_peer: Vec<String>,
 
@@ -102,6 +112,10 @@ pub struct ServerArgs {
     pub transport: Option<String>,
 
     /// rustp2p 的本机 peer id（默认随机生成并持久化）。
+    ///
+    /// **建议显式指定一个固定值** —— 对端的 `--allow-peer` 与
+    /// 打洞白名单要按它来配；随机生成的话每次换机器/换身份文件都要
+    /// 重新同步白名单。
     #[arg(long, value_name = "ID")]
     pub node_id: Option<String>,
 
@@ -182,6 +196,10 @@ pub struct ClientArgs {
     pub peer: Option<String>,
 
     /// rustp2p 的本机 peer id（默认随机生成并持久化）。
+    ///
+    /// **建议显式指定一个固定值** —— 对端的 `--allow-peer` 与
+    /// 打洞白名单要按它来配；随机生成的话每次换机器/换身份文件都要
+    /// 重新同步白名单。
     #[arg(long, value_name = "ID")]
     pub node_id: Option<String>,
 

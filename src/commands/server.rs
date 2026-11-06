@@ -151,6 +151,29 @@ async fn run_rustp2p(cfg: ServerConfig) -> Result<()> {
         bootstrap: cfg.rustp2p.bootstrap.clone(),
         stun_servers: cfg.rustp2p.stun_servers.clone(),
         max_assistant_sockets: cfg.rustp2p.max_assistant_sockets,
+        // **服务端绝不能限制打洞白名单。**
+        //
+        // 打洞是双向协议，而且上游的实现有个要命的细节：
+        // 收到 `PunchRequest` 时，只有 `punch_allowed(src)` 为真才会
+        // **回复 `PunchReply`**（rustp2p-quic protocol.rs 的
+        // `PunchRequest` 分支）。对端就是靠这个 `PunchReply`
+        // 来确认自己的直连路由 —— 没有它，对端永远建不起直连，
+        // QUIC 握手必然超时。
+        //
+        // 而服务端的 peer id 是**被连方**，它的白名单要靠 `--allow-peer`
+        // 预先填入客户端的 peer id —— 可客户端的 peer id 默认是
+        // **随机生成**的（除非对方也用 `--node-id` 固定），
+        // 服务端根本无从知道。
+        //
+        // ⇒ 一旦白名单里没有客户端的 peer id，对端就彻底打不通。
+        // 实测：白名单=[clientZ] 而客户端是 clientZ2 ⇒ 100% 超时；
+        // 去掉白名单 ⇒ 0.1 秒打通。
+        //
+        // 「只允许特定客户端接入」是**接入白名单**的事（iroh 后端的
+        // `allow_list` 语义），跟打洞白名单不是一回事，里保持分开。
+        //
+        // 需要收敛打洞对象时，应该由**客户端**把白名单设成目标 peer
+        // （客户端知道服务端的 peer id）。
         punch_whitelist: None,
         allow_list: cfg.allow_peers.clone(),
     };

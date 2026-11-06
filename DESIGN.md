@@ -93,6 +93,10 @@ server 公布 relay URL（iroh 标准：AddrFilter::relay_only）
 | D24 | **rustp2p 的 `open_bi` 必须自己加超时** | rustp2p 的 `open_bi` 在路由未建立时**一直等**（不是超时返回）。一次调用就永远挂着，重试逻辑形同虚设 | 单次尝试 30 秒超时 + 重试（重试会重新触发路由查找，中继路由确认有时序要求），总预算 5 分钟 |
 | D25 | **两端必须用同一个「公网可达」的 bootstrap 地址** | 中继靠**观测两端从哪个地址来**来推断可达端点。被控端若用 `127.0.0.1` 连本机的节点，中继观测到的就是回环地址 ⇒ 客户端永远打不到 | 被控端也必须用公网地址连 bootstrap |
 | D26 | **默认仍是 `--transport iroh`（保底）** | rustp2p 的中继是**协议层转发**（`QuicRelay` 包携带不透明 QUIC 密文），QUIC 流的建立仍需已确认的路由 ⇒ **打洞成功前 rustp2p 连不上**（实测打洞可达 4 分钟） | 想「先保证可用」就用 iroh（永远能连，只是慢）；想「争取直连」才切 rustp2p |
+| D27 | **打洞白名单只放在「客户端」一侧** | rustp2p 默认 `punch_whitelist: None` ⇒ 对 bootstrap 上**所有**已知 peer 打洞。实测 bootstrap 上常挂着 7~9 个**已退出的旧客户端实例**，于是：① 对称 NAT 端口空间（实测 3~6 万）被无关 peer 分掉；② `auto-punching` 循环**每轮只处理一个 peer**（且每 peer 10 秒一轮）⇒ 目标 peer 的实际打洞频率被稀释到 1/9。端口空间 6 万 ÷ 每轮 1500 扫描端口 ≈ **40 轮**才覆盖 ⇒ **永远打不通**。**但白名单放在服务端会直接把客户端挡在门外**（见 D30） | **客户端** `punch_whitelist = [目标 peer]`（客户端知道服务端的 peer id）⇒ 实测从「永远打不通」变成 **30 秒打通**；**服务端**保持 `None` |
+| D28 | **打洞是双向协议：两端必须打同一个对象** | 一端只打 vps-peer、另一端却给 bootstrap 上的旧实例打洞 ⇒ 双方永远碰不上。rustp2p 的 `try_execute_punch`（被动响应 `PunchRequest`）**不检查白名单**，所以「被动」打洞无法用白名单阻止 ⇒ 只能靠**双方都主动限定**来对齐 | **客户端**限定为目标 peer（服务端不限）；必要时两端都用 `--node-id` 固定 peer id |
+| D29 | **不要用 `last_seen` 判断「peer 还活着」** | bootstrap 转发 peer 列表时也会把 `last_seen` 刷成本地当前时间（`ingest_route_entries` → `confirm_peer_route` → `upsert_peer_info`）⇒ 已退出的旧实例看起来一样活跃 | 打洞白名单保持**静态**（客户端运行时指定目标 peer），不靠活跃度猜测 |
+| D30 | **服务端的 `--allow-peer` 绝不能兼作「打洞白名单」** | rustp2p-quic 的 `PunchRequest` 分支里，**只有 `punch_allowed(src)` 为真才会回复 `PunchReply`** —— 而对端正是靠这个 `PunchReply` 来确认自己的直连路由。服务端把白名单设成 `--allow-peer` 后，**客户端 peer id 默认随机生成** ⇒ 几乎必然不在名单里 ⇒ 服务端既不打洞、也不回 `PunchReply` ⇒ 对端永远建不起直连 ⇒ **QUIC 握手 100% 超时**。而且 `allow_list` 还会在 accept 层按 peer id 拒绝接入流 | 服务端 `punch_whitelist` **恒为 `None`**；`--allow-peer` 只作**接入白名单**，且要求对端用 `--node-id` 固定 peer id 才能匹配。实测：白名单=[clientZ] 而客户端是 clientZ2 ⇒ 超时；去掉服务端白名单 ⇒ **0.1 秒打通** |
 
 ---
 
