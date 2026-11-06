@@ -15,7 +15,7 @@ use iroh_rdp_tunnel::{
     addrpolicy::PublishPolicy,
     commands::server::{self, ServerRuntime},
     config::ServerConfig,
-    endpoint::{Discovery, EndpointOptions, TlsTrust, bind},
+    endpoint::{Discovery, EndpointOptions, bind},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -70,7 +70,7 @@ async fn start_server(
         relay_mode: RelayMode::custom([relay_url.clone()]),
         allow_list,
         discovery: Discovery::Disabled,
-        tls_trust: TlsTrust::InsecureSkipVerify,
+        ca_tls_config: Some(iroh::tls::CaTlsConfig::insecure_skip_verify()),
     };
     let rt = server::build(&cfg).await.unwrap();
     // 等被控端连上 relay，否则控制端拨过去时 relay 还不认识它。
@@ -95,7 +95,7 @@ async fn start_client(relay_url: RelayUrl) -> Endpoint {
         publish: PublishPolicy::RelayOnly,
         discovery: Discovery::Disabled,
         portmapper: false,
-        tls_trust: TlsTrust::InsecureSkipVerify,
+        ca_tls_config: Some(iroh::tls::CaTlsConfig::insecure_skip_verify()),
     })
     .await
     .unwrap();

@@ -102,7 +102,7 @@ pub async fn build(cfg: &ServerConfig) -> Result<ServerRuntime> {
         publish: cfg.publish,
         discovery: cfg.discovery,
         portmapper: true,
-        tls_trust: cfg.tls_trust,
+        ca_tls_config: cfg.ca_tls_config.clone(),
     })
     .await?;
 

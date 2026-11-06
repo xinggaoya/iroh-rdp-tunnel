@@ -13,7 +13,7 @@ use crate::{
     addrpolicy::PublishPolicy,
     commands,
     config::{ClientConfig, EnvSource, ServerConfig},
-    endpoint::{Discovery, TlsTrust},
+    endpoint::Discovery,
 };
 
 /// 顶层命令。
@@ -71,9 +71,9 @@ pub struct ServerArgs {
     #[arg(long)]
     pub no_discovery: bool,
 
-    /// 跳过中继的 TLS 证书校验（自建 relay 用自签证书时）。
-    #[arg(long)]
-    pub insecure_relay: bool,
+    /// 额外的根证书文件（PEM），用于信任自签证书的自建 relay。
+    #[arg(long, value_name = "PATH")]
+    pub ca_file: Option<PathBuf>,
 }
 
 /// `irt client` 的参数。
@@ -99,9 +99,9 @@ pub struct ClientArgs {
     #[arg(long)]
     pub no_discovery: bool,
 
-    /// 跳过中继的 TLS 证书校验（自建 relay 用自签证书时）。
-    #[arg(long)]
-    pub insecure_relay: bool,
+    /// 额外的根证书文件（PEM），用于信任自签证书的自建 relay。
+    #[arg(long, value_name = "PATH")]
+    pub ca_file: Option<PathBuf>,
 }
 
 /// `irt diag` 的参数。
@@ -132,7 +132,7 @@ pub fn resolve_server(args: &ServerArgs, env: &EnvSource) -> anyhow::Result<Serv
     let relay_mode = resolve_relay_mode(args.no_relay, &args.relay, env)?;
     let allow_list = resolve_allow_list(args, env)?;
     let discovery = resolve_discovery(args.no_discovery, env);
-    let tls_trust = resolve_tls_trust(args.insecure_relay, env);
+    let ca_tls_config = resolve_ca(args.ca_file.as_deref(), env)?;
 
     Ok(ServerConfig {
         key_file,
@@ -141,7 +141,7 @@ pub fn resolve_server(args: &ServerArgs, env: &EnvSource) -> anyhow::Result<Serv
         relay_mode,
         allow_list,
         discovery,
-        tls_trust,
+        ca_tls_config,
     })
 }
 
@@ -162,13 +162,13 @@ pub fn resolve_client(args: &ClientArgs, env: &EnvSource) -> anyhow::Result<Clie
         .with_context(|| format!("无法解析监听地址 `{listen}`"))?;
     let relay_mode = resolve_relay_mode(args.no_relay, &args.relay, env)?;
     let discovery = resolve_discovery(args.no_discovery, env);
-    let tls_trust = resolve_tls_trust(args.insecure_relay, env);
+    let ca_tls_config = resolve_ca(args.ca_file.as_deref(), env)?;
     Ok(ClientConfig {
         remote,
         listen,
         relay_mode,
         discovery,
-        tls_trust,
+        ca_tls_config,
     })
 }
 
@@ -240,12 +240,18 @@ fn resolve_discovery(no_discovery: bool, env: &EnvSource) -> Discovery {
     }
 }
 
-/// TLS 信任：CLI `--insecure-relay` / `IRT_INSECURE_RELAY` > 系统根证书。
-fn resolve_tls_trust(insecure: bool, env: &EnvSource) -> TlsTrust {
-    if insecure || env.get("IRT_INSECURE_RELAY").is_some() {
-        TlsTrust::InsecureSkipVerify
-    } else {
-        TlsTrust::System
+/// 自定义 CA：CLI `--ca-file` > 环境变量 `IRT_CA_FILE` > 无（用系统根证书）。
+fn resolve_ca(
+    ca_file: Option<&std::path::Path>,
+    env: &EnvSource,
+) -> anyhow::Result<Option<iroh::tls::CaTlsConfig>> {
+    let path = match ca_file {
+        Some(p) => Some(p.to_path_buf()),
+        None => env.get("IRT_CA_FILE").map(std::path::PathBuf::from),
+    };
+    match path {
+        Some(p) => Ok(Some(crate::endpoint::load_ca_file(&p)?)),
+        None => Ok(None),
     }
 }
 
@@ -278,6 +284,20 @@ mod tests {
     fn env(pairs: &[(&str, &str)]) -> EnvSource {
         EnvSource::from_pairs(pairs)
     }
+
+    /// 一张自签测试证书（PEM）。
+    const PEM_CERT: &str = "-----BEGIN CERTIFICATE-----
+MIIBhTCCASugAwIBAgIQIRi6zePL6mKjOipn+dNuaTAKBggqhkjOPQQDAjASMRAw
+DgYDVQQKEwdBY21lIENvMB4XDTE3MTAyMDE5NDMwNloXDTE4MTAyMDE5NDMwNlow
+EjEQMA4GA1UEChMHQWNtZSBDbzBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABD0d
+7VNhbWvZLWPuj/RtHFjvtJBEwOkhbN/BnnE8rnZR8+sbwnc/KhCk3FhnpHZnQz7B
+5aETbbIgmuvewdjvSBSjYzBhMA4GA1UdDwEB/wQEAwICpDATBgNVHSUEDDAKBggr
+BgEFBQcDATAPBgNVHRMBAf8EBTADAQH/MCkGA1UdEQQiMCCCDmxvY2FsaG9zdDo1
+NDUzgg4xMjcuMC4wLjE6NTQ1MzAKBggqhkjOPQQDAgNIADBFAiEA2zpJEPQyz6/l
+Wf86aX6PepsntZv2GYlA5UpabfT2EZICICpJ5h/iI+i341gBmLiAFQOyTDT+/wQc
+6MF9+Yw1Yy0t
+-----END CERTIFICATE-----
+";
 
     #[test]
     fn server_default_publish_policy_is_relay_only() {
@@ -471,29 +491,28 @@ mod tests {
     }
 
     #[test]
-    fn tls_trust_defaults_to_system_roots() {
-        let cfg = resolve_server(&ServerArgs::default(), &env(&[])).unwrap();
-        assert_eq!(cfg.tls_trust, TlsTrust::System);
-    }
-
-    #[test]
-    fn insecure_relay_cli_enables_skip_verify() {
-        let args = ServerArgs {
-            insecure_relay: true,
-            ..Default::default()
-        };
-        let cfg = resolve_server(&args, &env(&[])).unwrap();
-        assert_eq!(cfg.tls_trust, TlsTrust::InsecureSkipVerify);
-    }
-
-    #[test]
-    fn insecure_relay_env_enables_skip_verify() {
+    fn ca_file_env_is_loaded() {
+        let dir = std::env::temp_dir().join(format!("irt-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pem = dir.join("ca.pem");
+        // 一张自签证书（PEM），只用来验证能被解析。
+        std::fs::write(&pem, PEM_CERT).unwrap();
         let cfg = resolve_server(
             &ServerArgs::default(),
-            &env(&[("IRT_INSECURE_RELAY", "1")]),
+            &env(&[("IRT_CA_FILE", pem.to_str().unwrap())]),
         )
         .unwrap();
-        assert_eq!(cfg.tls_trust, TlsTrust::InsecureSkipVerify);
+        assert!(cfg.ca_tls_config.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ca_file_missing_is_rejected() {
+        let args = ServerArgs {
+            ca_file: Some(std::path::PathBuf::from("/definitely/not/here.pem")),
+            ..Default::default()
+        };
+        assert!(resolve_server(&args, &env(&[])).is_err());
     }
 
     #[test]

@@ -11,10 +11,9 @@ use std::{
 
 use iroh::{EndpointId, RelayMode};
 
-use crate::{
-    addrpolicy::PublishPolicy,
-    endpoint::{Discovery, TlsTrust},
-};
+use iroh::tls::CaTlsConfig;
+
+use crate::{addrpolicy::PublishPolicy, endpoint::Discovery};
 
 /// 被控端配置。
 #[derive(Debug, Clone)]
@@ -31,8 +30,8 @@ pub struct ServerConfig {
     pub allow_list: Vec<EndpointId>,
     /// 是否启用 n0 公共 pkarr / DNS。
     pub discovery: Discovery,
-    /// 中继连接的 TLS 信任模式。
-    pub tls_trust: TlsTrust,
+    /// 自定义 CA 信任配置；`None` 表示使用内置/系统根证书。
+    pub ca_tls_config: Option<CaTlsConfig>,
 }
 
 /// 控制端配置。
@@ -46,8 +45,8 @@ pub struct ClientConfig {
     pub relay_mode: RelayMode,
     /// 是否启用 n0 公共 DNS 解析。
     pub discovery: Discovery,
-    /// 中继连接的 TLS 信任模式。
-    pub tls_trust: TlsTrust,
+    /// 自定义 CA 信任配置；`None` 表示使用内置/系统根证书。
+    pub ca_tls_config: Option<CaTlsConfig>,
 }
 
 /// 注入式环境变量来源。

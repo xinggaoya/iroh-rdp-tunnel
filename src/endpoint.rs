@@ -4,7 +4,7 @@
 //! server 与 client 共用同一套代码路径；集成测试也走同一套，只是把公共发现服务关掉，
 //! 从而做到**不依赖外网**。
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use iroh::{
     Endpoint, RelayMode, SecretKey,
     address_lookup::{DnsAddressLookup, PkarrPublisher},
@@ -14,18 +14,6 @@ use iroh::{
 };
 
 use crate::{ALPN, addrpolicy::PublishPolicy};
-
-/// 中继连接的 TLS 信任模式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TlsTrust {
-    /// 使用系统根证书（生产默认）。
-    System,
-    /// 跳过证书校验。
-    ///
-    /// 只用于**自签证书**的自建 relay 与集成测试（进程内 relay 用的是自签证书）。
-    /// 在公网环境用这个模式等于放弃中间人防护，不要。
-    InsecureSkipVerify,
-}
 
 /// 地址发布 / 解析方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,8 +41,10 @@ pub struct EndpointOptions {
     ///
     /// 路由器不支持时自动跳过；EIM 映射下打洞并不依赖端口映射。
     pub portmapper: bool,
-    /// 中继连接的 TLS 信任模式。
-    pub tls_trust: TlsTrust,
+    /// 自定义 CA 信任配置；`None` 表示使用内置/系统根证书。
+    ///
+    /// 自建 relay 若用自签证书，把它的 CA 加进来（见 `load_ca_file`）。
+    pub ca_tls_config: Option<CaTlsConfig>,
 }
 
 impl Default for EndpointOptions {
@@ -65,7 +55,7 @@ impl Default for EndpointOptions {
             publish: PublishPolicy::RelayOnly,
             discovery: Discovery::Public,
             portmapper: true,
-            tls_trust: TlsTrust::System,
+            ca_tls_config: None,
         }
     }
 }
@@ -81,8 +71,8 @@ pub async fn bind(opts: EndpointOptions) -> Result<Endpoint> {
     if opts.portmapper {
         builder = builder.portmapper_config(PortmapperConfig::default());
     }
-    if opts.tls_trust == TlsTrust::InsecureSkipVerify {
-        builder = builder.ca_tls_config(CaTlsConfig::insecure_skip_verify());
+    if let Some(ca) = &opts.ca_tls_config {
+        builder = builder.ca_tls_config(ca.clone());
     }
 
     match opts.discovery {
@@ -113,12 +103,28 @@ pub async fn bind_resolver_only(opts: EndpointOptions) -> Result<Endpoint> {
     if opts.portmapper {
         builder = builder.portmapper_config(PortmapperConfig::default());
     }
-    if opts.tls_trust == TlsTrust::InsecureSkipVerify {
-        builder = builder.ca_tls_config(CaTlsConfig::insecure_skip_verify());
+    if let Some(ca) = &opts.ca_tls_config {
+        builder = builder.ca_tls_config(ca.clone());
     }
     if opts.discovery == Discovery::Public {
         builder = builder.address_lookup(DnsAddressLookup::n0_dns());
     }
 
     Ok(builder.bind().await?)
+}
+
+/// 从 PEM 文件读取额外的根证书。
+///
+/// 用于信任**自签证书**的自建 relay —— 这是比「跳过证书校验」更安全的做法。
+pub fn load_ca_file(path: &std::path::Path) -> anyhow::Result<CaTlsConfig> {
+    let data = std::fs::read(path)
+        .with_context(|| format!("读取 CA 文件失败: {}", path.display()))?;
+    let mut reader = std::io::BufReader::new(&data[..]);
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("解析 PEM 证书失败: {}", path.display()))?;
+    if certs.is_empty() {
+        anyhow::bail!("CA 文件 {} 里没有找到任何 PEM 证书", path.display());
+    }
+    Ok(CaTlsConfig::default().with_extra_roots(certs))
 }

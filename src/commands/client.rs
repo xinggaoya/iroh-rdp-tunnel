@@ -31,7 +31,7 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
         publish: crate::addrpolicy::PublishPolicy::RelayOnly,
         discovery: cfg.discovery,
         portmapper: true,
-        tls_trust: cfg.tls_trust,
+        ca_tls_config: cfg.ca_tls_config.clone(),
     })
     .await?;
 
