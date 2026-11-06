@@ -182,8 +182,15 @@ pub fn verdict(profile: &NatProfile) -> Verdict {
             reasons.push(
                 "映射随目标变化（对称 NAT）⇒ 通告出去的公网端点对不上号，打洞必败".into(),
             );
+            reasons.push(
+                "原因：iroh 1.0.2 的打洞候选**只能**来自 QAD（对中继观测到的公网端点），\
+                 而对称 NAT 下「对中继的映射」≠「对服务端的映射」；\
+                 QUIC 的 observed address 报告虽能修正，iroh 尚未启用也未暴露"
+                    .into(),
+            );
             advice.push(
-                "只能走中继；或在光猫上手工把内网 UDP 端口固定转发出去（消除对称 NAT 的影响）"
+                "只能走中继；或在路由器上手工把内网 UDP 端口固定转发出去\
+                 （端口固定 ⇒ 映射与目标无关 ⇒ 变回 EIM ⇒ 打洞可成）"
                     .into(),
             );
             Expectation::RelayOnly
@@ -204,17 +211,34 @@ pub fn verdict(profile: &NatProfile) -> Verdict {
     match &profile.port_mapping {
         PortMappingStatus::Unsupported => {
             reasons.push(
-                "UPnP / NAT-PMP / PCP 均不支持 ⇒ 不影响打洞（EIM 下内端口固定即端点稳定），仅损失「首包更快」的机会"
+                "UPnP / NAT-PMP / PCP 均不支持 ⇒ 不影响 EIM 下的打洞；但若映射随目标变化（非 EIM），\
+                 就没有办法把映射固定下来，打洞无解"
+                    .into(),
+            );
+            advice.push(
+                "若本机 NAT 是对称型（映射随目标变化）：在路由器上手工把**本机 UDP 端口**\
+                 固定转发出去 —— 端口固定后公网端口不再随目标变化，映射即变成 EIM，打洞就能成"
                     .into(),
             );
         }
         PortMappingStatus::Partial { upnp, nat_pmp, pcp } => {
             reasons.push(format!(
-                "端口映射部分可用（UPnP={upnp} NAT-PMP={nat_pmp} PCP={pcp}）⇒ 可以争取更快的首包"
+                "端口映射部分可用（UPnP={upnp} NAT-PMP={nat_pmp} PCP={pcp}）\
+                 ⇒ 可以争取更快的首包"
             ));
+            if profile.mapping == MappingBehavior::Symmetric {
+                reasons.push(
+                    "且本机 NAT 是对称型（映射随目标变化）⇒ 端口映射正是破解它的手段：\
+                     固定端口后公网端点不再随目标变化，打洞可成"
+                        .into(),
+                );
+                advice.push(
+                    "启用路由器上的 UPnP / NAT-PMP / PCP（本工具会自动尝试申请端口映射）".into(),
+                );
+            }
         }
         PortMappingStatus::ProbeFailed(err) => {
-            reasons.push(format!("端口映射探测失败：{err} ⇒ 不影响打洞"));
+            reasons.push(format!("端口映射探测失败：{err} ⇒ 不影响 EIM 下的打洞"));
         }
     }
 

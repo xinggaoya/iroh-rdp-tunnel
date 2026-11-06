@@ -446,6 +446,41 @@ net report 要连上 relay、跑完多个中继的对比才出结果，**实测�
 > 副作用：server / client 启动会慢几秒（要等 QAD 探测跑完）。
 > 对 RDP 隧道完全无影响 —— 反正你也要等 mstsc 连上才能用。
 
+### 坑 6：iroh 1.0.2 的打洞候选**只能**来自 QAD ⇒ 对称 NAT 无解
+
+这是整条调试链的**最终结论**，也是很多人在 iroh 上卡住的原因。
+
+**iroh 1.0.2 通告给对端的可达地址，只有 QAD 一个来源** —— 即
+「从中继观测到的公网端点」（`socket.rs:1838` `DirectAddrType::Qad`）。
+
+于是在**映射随目标变化**（ADM/对称）的 NAT 后面：
+
+| 映射 | 端口 |
+|---|---|
+| 客户端 → 中继 | `public_C:P_relay` ← iroh 通告的就是这个 |
+| 客户端 → 服务端 | `public_C:P_server` ← 真正能通的是这个 |
+
+`P_relay ≠ P_server` ⇒ 服务端按通告的端点打过去 ⇒ 客户端 NAT 查表落空 ⇒ 丢包。
+
+> QUIC 本身有 **observed address** 传输参数，正是为这个场景设计的
+> （noq 的文档原话：*"can aid the current endpoint in inferring its reachable
+> address, which in most NAT'd networks will not be easily available to it"*）。
+> 但 **iroh 1.0.2 内部既没有启用、也没有对外暴露**它
+> （`Role` 派生了 `Default` ⇒ `send=false, receive=false`；iroh 的
+> `endpoint/quic.rs` 里只有 builder 方法，默认 transport config 不打开）。
+> 所以这条纠错链路在 iroh 上暂时用不上。
+
+**唯一能打破的办法：让映射与目标无关。**
+
+| 手段 | 效果 |
+|---|---|
+| 路由器上固定转发本机 UDP 端口 | 公网端口不再随目标变化 ⇒ 变回 EIM ⇒ 打洞可成 |
+| 启用 UPnP / NAT-PMP / PCP | 同上（本工具会自动尝试申请） |
+| 换网络（手机热点 / 4G） | 多数运营商给的是 EIM |
+
+`irt diag` 的 `端口映射` 一行就是在测这个。**在**控制端**跑 `irt diag`**：
+若 UPnP ✅，iroh 会自动申请端口映射 ⇒ 对称 NAT 被破解 ⇒ 直连可成。
+
 ### 顺带：两个可以忽略的告警
 
 | 告警 | 含义 |
