@@ -1,12 +1,32 @@
-//! Shared constants for the iroh-rdp-tunnel server / client.
+//! iroh-rdp-tunnel —— 基于 iroh 的 Windows RDP 点对点隧道。
+//!
+//! 库部分只做模块聚合与公共常量再导出；业务逻辑在 [`commands`] 子模块里，
+//! 便于集成测试直接调用。
 
-// ALPN identifier negotiated in the QUIC handshake; both sides must match exactly.
+pub mod addrpolicy;
+pub mod cli;
+pub mod commands;
+pub mod config;
+pub mod diag;
+pub mod connmgr;
+pub mod endpoint;
+pub mod fw;
+pub mod keys;
+pub mod lookup;
+pub mod nat;
+pub mod netaddr;
+pub mod pathinfo;
+pub mod portmap;
+pub mod tunnel;
+
+/// QUIC 握手中协商的 ALPN；两端必须完全一致。
 pub const ALPN: &[u8] = b"iroh-rdp-tunnel/0";
 
-// Windows built-in RDP service (loopback) by default.
+/// 被控端本机 Windows RDP 服务地址（回环）。
 pub const RDP_LOCAL: &str = "127.0.0.1:3389";
 
-// Build tag — printed by both binaries on startup so users can tell at a
-// glance whether they are running an old or new binary.
-pub const BUILD_TAG: &str = "v0.1.4-ip-only-by-default";
+/// 控制端本地监听的「假 RDP」地址。
+pub const LISTEN_ADDR: &str = "127.0.0.1:13389";
 
+/// 构建标记 —— 启动时打印，方便区分新旧二进制。
+pub const BUILD_TAG: &str = "v0.2.1";
