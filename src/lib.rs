@@ -7,6 +7,7 @@ pub mod addrpolicy;
 pub mod cli;
 pub mod commands;
 pub mod config;
+pub mod connmgr;
 pub mod keys;
 pub mod tunnel;
 
