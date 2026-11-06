@@ -321,10 +321,14 @@ pub fn spawn_path_reporter(
                 DIRECT_WAIT_WINDOW.as_secs()
             );
             println!(
-                " [路径·{tag2}]   ↳ 排查 1：两端是否用了**同一个** relay？（对比两端启动时的中继地址）"
+                " [路径·{tag2}]   ↳ 排查 1：**对端**的 Windows 防火墙是否放行了入站 UDP？\
+                 （打洞要双向；在对端执行 irt client --install-firewall-rule）"
             );
             println!(
-                " [路径·{tag2}]   ↳ 排查 2：对端 NAT 映射随目标变化（非 EIM）\
+                " [路径·{tag2}]   ↳ 排查 2：两端是否用了**同一个** relay？（对比两端启动时的中继地址）"
+            );
+            println!(
+                " [路径·{tag2}]   ↳ 排查 3：对端 NAT 映射随目标变化（非 EIM）\
                  → 对端需做端口映射或换网络"
             );
         }
