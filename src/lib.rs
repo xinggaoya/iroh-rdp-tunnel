@@ -7,6 +7,8 @@ pub mod addrpolicy;
 pub mod cli;
 pub mod commands;
 pub mod config;
+pub mod keys;
+pub mod tunnel;
 
 /// QUIC 握手中协商的 ALPN；两端必须完全一致。
 pub const ALPN: &[u8] = b"iroh-rdp-tunnel/0";
