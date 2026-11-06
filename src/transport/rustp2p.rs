@@ -68,6 +68,28 @@ const PATH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1
 /// 等待对端被 bootstrap 发现的上限。
 const PEER_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// 打开流的总预算。
+///
+/// 打洞可能要**几分钟**（对称 NAT 下端口范围大，只能穷举）。
+/// 这段时间里 RDP 不能连不上 —— 它可以先走中继。
+/// 所以这里不是「等打洞成功」，而是「反复尝试打开流，直到某次成功」。
+const OPEN_STREAM_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// 两次打开流之间的重试间隔。
+const OPEN_STREAM_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// 单次打开流的等待上限。
+///
+/// **rustp2p 的 `open_bi` 在路由尚未建立时会一直等**（不是超时返回）——
+/// 它在等「对端可达」的确认，而确认可能要等打洞成功、或等中继路由协商完成。
+///
+/// 所以这里必须自己加超时：否则一次调用就永远挂着，重试逻辑形同虚设，
+/// 用户看到的就是「连不上」。
+///
+/// 每次超时后重试会**重新触发一次路由查找** —— 中继路由的确认
+/// （`IDRouteQuery`/`IDRouteReply`）有时序要求，重试一次就可能赶上。
+const OPEN_STREAM_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// rustp2p 传输端点的配置。
 #[derive(Debug, Clone)]
 pub struct Rustp2pOptions {
@@ -359,7 +381,7 @@ impl TransportEndpoint for Rustp2pTransport {
         };
         let peer_id = PeerId::new(id.clone());
 
-        // **必须先等对端出现在已知列表里**。
+        // **第一步：等对端被 bootstrap 发现**。
         //
         // rustp2p 的 `open_bi` 内部是「连不上就重试两次」，而每次重试都会
         // 等路由建立 —— 对端还没被 bootstrap 的 peer 列表发现时，
@@ -370,20 +392,60 @@ impl TransportEndpoint for Rustp2pTransport {
         while !self.endpoint.known_peers().iter().any(|p| p.peer_id == peer_id) {
             if std::time::Instant::now() >= deadline {
                 anyhow::bail!(
-                    "等待对端 {id} 出现超时（{} 秒）—— 检查 bootstrap 是否可达、                     两端是否连的是同一个 bootstrap",
+                    "等待对端 {id} 出现超时（{} 秒）—— 检查 bootstrap 是否可达、\
+                     两端是否连的是同一个 bootstrap",
                     PEER_DISCOVERY_TIMEOUT.as_secs()
                 );
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
-        tracing::debug!("对端 {id} 已出现，打开双向流");
+        tracing::debug!("对端 {id} 已出现");
 
-        let (send, recv) = self
-            .endpoint
-            .open_bi(peer_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("打开到 {id} 的双向流失败: {e}"))?;
-        Ok(Box::new(Rustp2pStream::new(send, recv)))
+        // **第二步：反复尝试打开流，直到成功或预算耗尽**。
+        //
+        // 为什么不能只试一次：打洞要时间。对称 NAT 下端口范围可能高达几万个，
+        // 端口预测 + 穷举需要几分钟。这期间**中继路径是通的** ——
+        // RDP 完全可以先走中继连上，打洞成功后再自动切到直连。
+        //
+        // 之前只试一次的后果：打洞还没完成时直接「QUIC handshake timed out」，
+        // 用户看到的就是「连不上」。
+        let deadline = std::time::Instant::now() + OPEN_STREAM_BUDGET;
+        let mut attempt: u32 = 0;
+        loop {
+            // 单次尝试加超时 —— rustp2p 的 `open_bi` 在路由未建立时会一直等。
+            let outcome = tokio::time::timeout(
+                OPEN_STREAM_ATTEMPT_TIMEOUT,
+                self.endpoint.open_bi(peer_id.clone()),
+            )
+            .await;
+
+            match outcome {
+                Ok(Ok((send, recv))) => {
+                    if attempt > 0 {
+                        tracing::info!("打开到 {id} 的双向流成功（第 {attempt} 次尝试）");
+                    }
+                    return Ok(Box::new(Rustp2pStream::new(send, recv)));
+                }
+                Ok(Err(e)) => {
+                    attempt = attempt.saturating_add(1);
+                    tracing::info!("打开到 {id} 的双向流失败（第 {attempt} 次）: {e} —— 继续等");
+                }
+                Err(_) => {
+                    attempt = attempt.saturating_add(1);
+                    tracing::info!(
+                        "打开到 {id} 的双向流等待超过 {} 秒（第 {attempt} 次）—— 路由尚未建立，继续等",
+                        OPEN_STREAM_ATTEMPT_TIMEOUT.as_secs()
+                    );
+                }
+            }
+
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "打开到 {id} 的双向流失败（{OPEN_STREAM_BUDGET:?} 内尝试 {attempt} 次）——                      打洞与中继路由都还没建立"
+                );
+            }
+            tokio::time::sleep(OPEN_STREAM_RETRY_INTERVAL).await;
+        }
     }
 
     async fn accept_stream(&self) -> Result<AcceptedStream> {
@@ -578,11 +640,21 @@ impl AsyncWrite for Rustp2pStream {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
 
-        // 1) 先把上次没被接受的数据送出去。
+        // 1) 上次挂起的数据现在送出去了 —— **必须记账并立刻返回**。
+        //
+        // 上一次 `poll_write` 返回的是 `Pending`，按 `AsyncWrite` 的契约，
+        // 上层以为什么都没写出去（它的 buf 因此没有推进，下次会带来一份
+        // 「上次的内容 + 新内容」的更长切片）。
+        //
+        // 所以这里送出 `pending_data` 之后只能返回 `Ok(pending_data.len())`
+        // —— 告诉上层「这批已经写完了」。
+        //
+        // **不能**接着把新的 buf 也发出去：那会把旧内容再发一遍。
         if !this.pending_data.is_empty() {
+            let len = this.pending_data.len();
             let data = std::mem::take(&mut this.pending_data);
             match this.write_tx.try_send(WriteCmd::Data(data)) {
-                Ok(()) => {}
+                Ok(()) => return Poll::Ready(Ok(len)),
                 Err(mpsc::error::TrySendError::Full(cmd)) => {
                     let WriteCmd::Data(data) = cmd else {
                         return Poll::Ready(Err(broken_pipe()));

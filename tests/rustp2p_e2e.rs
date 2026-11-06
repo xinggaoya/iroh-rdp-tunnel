@@ -227,3 +227,55 @@ async fn rustp2p_tunnel_roundtrips_large_payload() {
     assert_eq!(got, payload, "字节必须逐字节一致");
     assert_eq!(server_task.await.unwrap(), expect_len);
 }
+
+/// 背压路径 —— **专门盯住 `pending_data` 分支**。
+///
+/// 写通道容量有限（64 × 8 KB ≈ 512 KB）。对端**慢读**时，通道必然被填满，
+/// `poll_write` 就要走 `pending_data` + `Notify` 那条路。
+///
+/// 本地回环太快，1 MB 往往填不满通道 —— 所以这里让对端先「睡着」3 秒，
+/// 强制把背压路径逼出来。
+#[tokio::test]
+async fn rustp2p_slow_reader_exercises_backpressure() {
+    let (server, client) = spawn_topology().await;
+
+    let server_task = tokio::spawn(async move {
+        let accepted = server.accept_stream().await.expect("应接受到入站流");
+        let mut stream = accepted.stream;
+        // 先不读 —— 让对端的写通道被填满。
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut total = 0usize;
+        loop {
+            let n = stream.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            total += n;
+            stream.write_all(&buf[..n]).await.unwrap();
+        }
+        stream.shutdown().await.unwrap();
+        total
+    });
+
+    let mut stream = client
+        .open_stream(&PeerRef::Rustp2p("server".to_string()))
+        .await
+        .expect("应能打开双向流");
+
+    let payload: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let expect_len = payload.len();
+    stream.write_all(&payload).await.unwrap();
+    stream.shutdown().await.unwrap();
+
+    let mut got = Vec::new();
+    stream.read_to_end(&mut got).await.unwrap();
+
+    assert_eq!(
+        got.len(),
+        expect_len,
+        "字节数必须一致 —— 背压路径上若有重复，这里会炸"
+    );
+    assert_eq!(got, payload, "字节必须逐字节一致");
+    assert_eq!(server_task.await.unwrap(), expect_len);
+}
