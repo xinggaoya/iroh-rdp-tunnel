@@ -15,6 +15,9 @@ use futures::StreamExt;
 use iroh::{TransportAddr, endpoint::Connection, endpoint::PathEvent};
 use std::sync::{Arc, Mutex};
 
+/// 直连观察窗口：连接建立后多久还没出现直连路径，就提示当前走中继。
+pub const DIRECT_WAIT_WINDOW: Duration = Duration::from_secs(30);
+
 /// 路径类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathKind {
@@ -150,31 +153,73 @@ pub fn transition_label(prev: Option<PathKind>, now: PathKind) -> &'static str {
 /// 输出形如：
 /// ```text
 ///  [路径·client] 中继  https://aps1-1.relay.n0.iroh.link./  RTT 41ms
+///  [路径·client] 🔓 直连路径已打开  171.37.192.67:34622
 ///  [路径·client] ✅ 已切换到直连  171.37.192.67:34622  RTT 37ms
 /// ```
+///
+/// **不只打印被选中的路径** —— 直连路径「被打开又关闭」是打洞失败最直接的证据，
+/// 只看选中路径的话会得到一片空白，无法区分「没尝试打洞」和「打了但没通」。
 pub fn spawn_path_reporter(conn: Connection, tag: &str) -> tokio::task::JoinHandle<()> {
     let tag = tag.to_string();
+    let tag_events = tag.clone();
     let last = Arc::new(std::sync::Mutex::new(None::<(PathKind, String)>));
     let last2 = Arc::clone(&last);
     // 先把**当前**路径打一遍，避免错过订阅前的迁移。
     let mut events = conn.path_events();
-    tokio::spawn(async move {
+    let saw_direct = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saw_direct2 = Arc::clone(&saw_direct);
+    let handle = tokio::spawn(async move {
         if let Some(info) = describe_path(&conn) {
-            report(&last2, &tag, info);
+            report(&last2, &tag_events, info);
         }
         while let Some(event) = events.next().await {
             match event {
-                PathEvent::Opened { .. } | PathEvent::Selected { .. } => {
-                    if let Some(info) = describe_path(&conn) {
-                        report(&last2, &tag, info);
+                PathEvent::Opened { remote_addr, .. } => {
+                    // relay 路径必然打开，打出来只会刷屏；直连路径才是打洞的信号。
+                    if remote_addr.is_ip() {
+                        saw_direct2.store(true, std::sync::atomic::Ordering::Relaxed);
+                        println!(" [路径·{tag_events}] 🔓 直连路径已打开  {remote_addr}");
                     }
                 }
-                PathEvent::Closed { .. } | PathEvent::Lagged { .. } => {}
+                PathEvent::Selected { .. } => {
+                    if let Some(info) = describe_path(&conn) {
+                        if info.kind == PathKind::Direct {
+                            saw_direct2.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        report(&last2, &tag_events, info);
+                    }
+                }
+                PathEvent::Closed { remote_addr, .. } => {
+                    if remote_addr.is_ip() {
+                        println!(" [路径·{tag_events}] ❌ 直连路径已关闭  {remote_addr}");
+                    } else {
+                        println!(" [路径·{tag_events}] ⚠ 中继路径已关闭  {remote_addr}");
+                    }
+                }
                 // PathEvent 是 #[non_exhaustive]，未来新增变体时静默忽略。
                 _ => {}
             }
         }
-    })
+    });
+
+    // 观察窗口：连接建立后一段时间还没直连，就明确告知「当前走中继」。
+    // 否则用户只能看到「中继」两个字，不知道是还没打洞成功还是压根打不了。
+    let tag2 = tag.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(DIRECT_WAIT_WINDOW).await;
+        if !saw_direct.load(std::sync::atomic::Ordering::Relaxed) {
+            println!(
+                " [路径·{tag2}] ⚠ {} 秒内未建立直连路径，当前走中继（RDP 可用，延迟偏高）",
+                DIRECT_WAIT_WINDOW.as_secs()
+            );
+            println!(
+                " [路径·{tag2}]   ↳ 常见原因：对端 NAT 映射随目标变化（非 EIM），\
+                 公布出去的公网端点对不上号"
+            );
+        }
+    });
+
+    handle
 }
 
 /// 打印一次路径变化（去重：同一路径 + 同一地址不重复打印）。
