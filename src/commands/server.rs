@@ -19,6 +19,7 @@ use crate::{
     ALPN, BUILD_TAG,
     config::ServerConfig,
     endpoint::{EndpointOptions, bind},
+    fw::{RULE_NAME, current_exe, status, status_hint},
     keys::{load_or_create_secret_key, write_endpoint_id_hint},
     pathinfo::spawn_path_reporter,
     tunnel::bridge_quic_to_tcp,
@@ -168,6 +169,13 @@ fn print_banner(cfg: &ServerConfig, endpoint: &Endpoint, endpoint_id: EndpointId
         }
     }
     println!(" RDP 目标      : {}", cfg.rdp_target);
+
+    let fw_status = match current_exe() {
+        Ok(exe) => status(&exe),
+        Err(_) => crate::fw::FirewallStatus::Unknown,
+    };
+    println!(" 防火墙        : {}", status_hint(fw_status));
+    println!("                 （规则名: {RULE_NAME}）");
     if cfg.allow_list.is_empty() {
         println!(" 接入白名单    : （未启用，任何 endpoint id 均可接入）");
     } else {

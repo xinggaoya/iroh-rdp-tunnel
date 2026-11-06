@@ -9,6 +9,7 @@ pub mod commands;
 pub mod config;
 pub mod connmgr;
 pub mod endpoint;
+pub mod fw;
 pub mod keys;
 pub mod pathinfo;
 pub mod tunnel;

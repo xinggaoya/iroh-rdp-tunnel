@@ -74,6 +74,14 @@ pub struct ServerArgs {
     /// 额外的根证书文件（PEM），用于信任自签证书的自建 relay。
     #[arg(long, value_name = "PATH")]
     pub ca_file: Option<PathBuf>,
+
+    /// 为本程序添加入站 UDP 防火墙放行规则后退出（需管理员权限）。
+    #[arg(long)]
+    pub install_firewall_rule: bool,
+
+    /// 删除本程序的入站 UDP 防火墙放行规则后退出（需管理员权限）。
+    #[arg(long)]
+    pub uninstall_firewall_rule: bool,
 }
 
 /// `irt client` 的参数。
@@ -102,6 +110,14 @@ pub struct ClientArgs {
     /// 额外的根证书文件（PEM），用于信任自签证书的自建 relay。
     #[arg(long, value_name = "PATH")]
     pub ca_file: Option<PathBuf>,
+
+    /// 为本程序添加入站 UDP 防火墙放行规则后退出（需管理员权限）。
+    #[arg(long)]
+    pub install_firewall_rule: bool,
+
+    /// 删除本程序的入站 UDP 防火墙放行规则后退出（需管理员权限）。
+    #[arg(long)]
+    pub uninstall_firewall_rule: bool,
 }
 
 /// `irt diag` 的参数。
@@ -271,10 +287,37 @@ pub async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
     let env = EnvSource::from_process();
     match &args.command {
-        Command::Server(a) => commands::server::run(resolve_server(a, &env)?).await,
+        Command::Server(a) => {
+            let cfg = resolve_server(a, &env)?;
+            if a.install_firewall_rule {
+                return install_firewall_rule();
+            }
+            if a.uninstall_firewall_rule {
+                return uninstall_firewall_rule();
+            }
+            commands::server::run(cfg).await
+        }
         Command::Client(a) => commands::client::run(resolve_client(a, &env)?).await,
         Command::Diag(a) => commands::diag::run(a.clone()).await,
     }
+}
+
+/// 添加入站 UDP 防火墙放行规则。
+fn install_firewall_rule() -> anyhow::Result<()> {
+    let exe = crate::fw::current_exe()?;
+    crate::fw::install_udp_allow_rule(&exe, crate::fw::RULE_NAME)?;
+    println!("✅ 已添加入站 UDP 放行规则");
+    println!("   规则名: {}", crate::fw::RULE_NAME);
+    println!("   程序  : {}", exe.display());
+    Ok(())
+}
+
+/// 删除入站 UDP 防火墙放行规则。
+fn uninstall_firewall_rule() -> anyhow::Result<()> {
+    crate::fw::remove_rule(crate::fw::RULE_NAME)?;
+    println!("✅ 已删除入站 UDP 放行规则");
+    println!("   规则名: {}", crate::fw::RULE_NAME);
+    Ok(())
 }
 
 #[cfg(test)]
