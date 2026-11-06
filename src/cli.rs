@@ -25,7 +25,7 @@ use crate::{
 #[command(
     name = "irt",
     version,
-    about = "iroh-rdp-tunnel —— 基于 iroh 的 Windows RDP 点对点隧道",
+    about = "iroh-rdp-tunnel —— Windows RDP 点对点隧道（iroh / rustp2p 双后端）",
     propagate_version = true
 )]
 pub struct Args {
