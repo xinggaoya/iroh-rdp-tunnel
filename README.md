@@ -307,6 +307,85 @@ iroh 的 net report **只能测映射行为，测不了过滤行为**。`irt dia
 
 ---
 
+## 实战排障：三个真实踩过的坑
+
+下面三条都是实际调试中真实遇到并定位到的，按「出现频率」排序。
+
+### 坑 1：两端用了不同的中继 ⇒ RTT 翻倍
+
+**症状**：连上了，但 RDP 巨卡；路径 RTT 高达 1152ms。
+
+**原因**：两端各自自动选 relay，很容易选到不同家。流量要先到**本端**的中继，
+再由它转发到**对端**的中继（多一跳），延迟直接叠加。
+
+```
+[路径·client] ⚠ 路径经由 https://euc1-1.relay.n0.iroh.link./ 中转，
+                但本端连的是 https://usw1-1.relay.n0.iroh.link./ —— 多了一跳中继转发
+```
+
+**修法**：两端显式指定**同一个** relay：
+
+```powershell
+.\irt.exe server --relay https://aps1-1.relay.n0.iroh.link./
+.\irt.exe client <id> --relay https://aps1-1.relay.n0.iroh.link./
+```
+
+**验证**：A 机 banner 的 `中继 :` 与 B 机 banner 的 `本端中继 :` 必须完全相同。
+
+> `RelayMode::custom()` 是**独占**模式 —— 指定了就不可能选到别的中继。
+> 所以只要两端显示的不一样，就一定有一端没指定。
+
+### 坑 2：对端 NAT 映射随目标变化（非 EIM）⇒ 打洞必败
+
+**症状**：连接建立（走中继），但永远等不到「✅ 已切换到直连」。
+
+**原因**：客户端日志里的
+`IPv4 address detected by QAD varies by destination` —— iroh 内部对应
+`mapping_varies_by_dest_ipv4 = Some(true)`（`net_report/report.rs:95`），
+含义是**同一个本地端口连不同目标，公网映射端点会变**。
+
+为什么这在数学上无解：
+
+| 环节 | 事实 | 源码位置 |
+|---|---|---|
+| 1 | iroh 通告的候选 = 「**对中继**观测到的公网端点」 | `socket.rs:1838` `DirectAddrType::Qad` |
+| 2 | 对中继的映射是 `public_ip:P_relay`，对服务器的映射是 `public_ip:P_server`，两者不等 | — |
+| 3 | 服务端按通告的候选打过去 → 客户端 NAT 查表落空 → 丢包 | `remote_state.rs` `do_holepunching()` |
+
+**修法**（只能改对端那一侧，iroh 这边无解）：
+
+- **对端做端口映射** —— 把内网 UDP 端口固定转发出去，映射就与目标无关了 ⇒ 变回 EIM
+- **对端换网络** —— 手机热点 / 4G，多数运营商给的是 EIM
+- **对端开通 IPv6**（见坑 3）—— 根本不需要 NAT 遍历
+
+### 坑 3：只有一端有 IPv6 ⇒ 直连被 NetworkUnreachable 直接掐死
+
+**症状**：服务端日志里
+
+```
+poll_send{network_path=Ip { remote: [2408:845d:102:6406:...]:56428, local: None }}
+  sendmsg error: 10051 NetworkUnreachable
+```
+
+**原因**：`local: None` = **本机没有 IPv6 源地址**，发不出 IPv6 包。
+
+**这其实是最好的解法**：IPv6 直连**根本不需要 NAT 遍历**。
+只要两端都有全局 IPv6，直接就通，延迟约 37ms。
+
+- 客户端本来就有 IPv6（`2408:845d:102:6406:...`）
+- 服务端需要在光猫/路由器上开通 IPv6（联通 10G-GPON 光猫通常支持，只是可能没下发到内网）
+- **开通后无需改任何参数** —— IPv6 候选是在已建立的连接上交换的，
+  与 `--publish` 策略无关
+
+### 顺带：两个可以忽略的告警
+
+| 告警 | 含义 |
+|---|---|
+| `WSAEMSGSIZE (10040)` | Windows UDP 发送缓冲区偏小，只影响 **IPv6 QAD 探测**（1389 字节），不影响连通性 |
+| `MultipathNotNegotiated` | 路径关闭时的良性告警 |
+
+---
+
 ## 排障决策树
 
 | 现象 | 排查顺序 |

@@ -234,8 +234,32 @@ pub fn verdict(profile: &NatProfile) -> Verdict {
         }
     }
 
+    // IPv6：一旦本机有全局 IPv6，对端就能直接用 IPv6 连过来 ——
+    // IPv6 根本不需要 NAT 遍历，是绕过对称 NAT 最省事的路子。
+    match &profile.global_v6 {
+        Some(v6) => advice.push(format!(
+            "本机有全局 IPv6（{v6}）⇒ 对端可用 IPv6 直连，完全绕开 NAT 遍历；\
+             保持默认 --publish relay 即可（IPv6 候选在已建立的连接上交换）"
+        )),
+        None => {
+            if profile.udp_v4 {
+                advice.push(
+                    "本机无全局 IPv6 ⇒ 若对端有 IPv6 而本机没有，直连会因 \
+                     NetworkUnreachable 直接失败；运营商光猫通常支持 IPv6，\
+                     建议在光猫/路由器上开通并让内网拿到全局地址"
+                        .into(),
+                );
+            }
+        }
+    }
+
     advice.push("server 保持默认 --publish relay".into());
     advice.push("管理员执行 irt server --install-firewall-rule 放行入站 UDP".into());
+    advice.push(
+        "两端用**同一个** relay（如 --relay https://aps1-1.relay.n0.iroh.link./）：\
+         各自自动选容易选到不同家，多一跳中继转发会让 RTT 翻倍"
+            .into(),
+    );
     advice.push("连接后看 client 输出是否出现「✅ 已切换到直连」".into());
 
     Verdict {
