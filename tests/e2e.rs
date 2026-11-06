@@ -3,6 +3,11 @@
 //! **不依赖外网**：relay 由 `iroh::test_utils::run_relay_server()` 在进程内启动，
 //! 地址发布/解析全部关闭（`Discovery::Disabled`），
 //! 客户端直接带着 relay URL 拨号，绕开 DNS。
+//!
+//! 覆盖两条路径：
+//! 1. 直接在 QUIC 流上收发（验证 iroh 链路与字节完整性）；
+//! 2. **与生产完全相同**的客户端路径：本地 TCP → 常驻 QUIC 连接 → 远端
+//!    （`connmgr::ConnManager` + `commands::client::serve_local`）。
 
 use std::{collections::BTreeSet, net::SocketAddr, path::PathBuf, time::Duration};
 
@@ -15,6 +20,7 @@ use iroh_rdp_tunnel::{
     addrpolicy::PublishPolicy,
     commands::server::{self, ServerRuntime},
     config::ServerConfig,
+    connmgr::ConnManager,
     endpoint::{Discovery, EndpointOptions, bind},
     pathinfo,
 };
@@ -202,4 +208,40 @@ async fn allow_list_accepts_listed_peer() {
     send.write_all(b"ping").await.unwrap();
     let got = reader.await.unwrap();
     assert_eq!(&got, b"ping");
+}
+
+/// 与生产完全相同的客户端路径：本地 TCP → 常驻 QUIC 连接 → 远端 → 假 RDP 回显。
+#[tokio::test]
+async fn client_local_tcp_path_roundtrips() {
+    let (_map, relay_url, _relay) = iroh::test_utils::run_relay_server().await.unwrap();
+    let rdp = spawn_fake_rdp().await;
+    let (remote, _rt, _router) = start_server(relay_url.clone(), rdp, vec![]).await;
+
+    let client_ep = start_client(relay_url).await;
+    // 明确指定远端地址：测试里地址发现是关掉的。
+    let mgr = ConnManager::start_with_addr(client_ep, remote.id, remote.clone());
+
+    // 监听本地「假 RDP」端口。
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = iroh_rdp_tunnel::commands::client::serve_local(mgr, listener).await;
+    });
+
+    // 像 mstsc 一样连上去。
+    let tcp = tokio::net::TcpStream::connect(local_addr).await.unwrap();
+    let payload: Vec<u8> = (0..32 * 1024).map(|i| (i % 251) as u8).collect();
+    let expect_len = payload.len();
+
+    let (mut rd, mut wr) = tcp.into_split();
+    let reader = tokio::spawn(async move {
+        let mut got = vec![0u8; expect_len];
+        rd.read_exact(&mut got).await.unwrap();
+        got
+    });
+    wr.write_all(&payload).await.unwrap();
+    let got = reader.await.unwrap();
+
+    assert_eq!(got.len(), payload.len(), "字节数必须一致");
+    assert_eq!(got, payload, "字节必须逐字节一致");
 }

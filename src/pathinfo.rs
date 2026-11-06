@@ -50,7 +50,15 @@ pub struct PathInfo {
 /// 自定义传输（`Custom`）既不是直连 IP 也不是 relay，归为中继 ——
 /// 保守起见不把它当成「已经打洞成功」。
 pub fn classify(addr: &TransportAddr) -> PathKind {
-    if addr.is_ip() {
+    classify_by_is_ip(addr.is_ip())
+}
+
+/// 判定逻辑本体（与 `TransportAddr` 解耦，便于单测）。
+///
+/// `TransportAddr::Custom` 的具体类型没有从 `iroh` 导出，外部无法构造，
+/// 所以把判定拆成这个纯函数来覆盖。
+pub fn classify_by_is_ip(is_ip: bool) -> PathKind {
+    if is_ip {
         PathKind::Direct
     } else {
         PathKind::Relay
@@ -203,6 +211,14 @@ mod tests {
         let url: RelayUrl = "https://aps1-1.relay.n0.iroh.link.".parse().unwrap();
         let addr = TransportAddr::Relay(url);
         assert_eq!(classify(&addr), PathKind::Relay);
+    }
+
+    #[test]
+    fn non_ip_addresses_are_treated_as_relay() {
+        // 自定义传输（Custom）既不是直连 IP 也不是 relay ——
+        // 保守起见不把它当成「已经打洞成功」。
+        assert_eq!(classify_by_is_ip(false), PathKind::Relay);
+        assert_eq!(classify_by_is_ip(true), PathKind::Direct);
     }
 
     #[test]

@@ -47,6 +47,11 @@ pub struct ClientConfig {
     pub discovery: Discovery,
     /// 自定义 CA 信任配置；`None` 表示使用内置/系统根证书。
     pub ca_tls_config: Option<CaTlsConfig>,
+    /// 控制端自己的私钥文件路径。
+    ///
+    /// 持久化后控制端的 endpoint id 是固定的，可以直接写进被控端的
+    /// `--allow` 白名单里 —— 否则白名单没法用（客户端每次启动都是新 id）。
+    pub key_file: PathBuf,
 }
 
 /// 注入式环境变量来源。
@@ -100,6 +105,16 @@ impl EnvSource {
 /// - Windows：`%APPDATA%\iroh-rdp-tunnel\server.key`
 /// - 其它平台：`$XDG_CONFIG_HOME/iroh-rdp-tunnel/server.key`，缺省 `~/.config/...`
 pub fn default_key_file() -> PathBuf {
+    config_dir().join("server.key")
+}
+
+/// 控制端私钥文件默认路径。
+pub fn default_client_key_file() -> PathBuf {
+    config_dir().join("client.key")
+}
+
+/// 配置目录。
+fn config_dir() -> PathBuf {
     let base = if cfg!(windows) {
         std::env::var_os("APPDATA")
             .map(PathBuf::from)
@@ -109,7 +124,7 @@ pub fn default_key_file() -> PathBuf {
             .map(PathBuf::from)
             .unwrap_or_else(|| home_dir().join(".config"))
     };
-    base.join("iroh-rdp-tunnel").join("server.key")
+    base.join("iroh-rdp-tunnel")
 }
 
 /// 用户主目录。
@@ -151,6 +166,21 @@ mod tests {
         assert!(
             p.to_string_lossy().contains("iroh-rdp-tunnel"),
             "密钥文件应放在 iroh-rdp-tunnel 目录下，实际: {p:?}"
+        );
+    }
+
+    #[test]
+    fn default_client_key_file_is_absolute_and_named_client_key() {
+        let p = default_client_key_file();
+        assert!(p.is_absolute(), "必须是绝对路径，实际: {p:?}");
+        assert_eq!(p.file_name().and_then(|s| s.to_str()), Some("client.key"));
+        assert!(
+            p.to_string_lossy().contains("iroh-rdp-tunnel"),
+            "实际: {p:?}"
+        );
+        assert_ne!(
+            p, default_key_file(),
+            "客户端与被控端必须用不同的密钥文件，否则 endpoint id 会撞车"
         );
     }
 

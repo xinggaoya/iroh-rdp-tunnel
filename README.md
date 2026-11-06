@@ -80,6 +80,8 @@ cargo build --release --target x86_64-pc-windows-gnu
  iroh-rdp-tunnel CLIENT  (v0.2.0)
 =========================================================
  远端 endpoint : 1c46b334278b7ba001fed57d9000192b6994c198599fcfb14dc320054cfe9922
+ 本机 endpoint : 49e7105bec4160af91e110c07f7f09b696d01830990910cb3e2e76e01cc43af2
+                 （可写进被控端的 --allow 白名单）
  本地 TCP 监听 : 127.0.0.1:13389
 
  正在与远端建立连接…
@@ -90,6 +92,9 @@ cargo build --release --target x86_64-pc-windows-gnu
      手机    : RD Client → 地址填 127.0.0.1:13389
  (Ctrl-C 退出)
 ```
+
+> 控制端的私钥也持久化（默认 `%APPDATA%\iroh-rdp-tunnel\client.key`），
+> 所以**本机 endpoint** 是固定的 —— 想加白名单就把这一串填到被控端的 `--allow` 里。
 
 ### 4. 用系统自带的远程桌面连接
 

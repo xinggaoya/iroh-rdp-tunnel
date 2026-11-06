@@ -73,21 +73,35 @@ where
     let (mut a_read, mut a_write) = tokio::io::split(a);
     let (mut b_read, mut b_write) = tokio::io::split(b);
 
-    let up = async {
+    // 一侧读到 EOF 时只半关闭对端的写半边，另一侧继续 —— 这是 TCP 的半关闭语义，
+    // RDP 依赖它来判定流结束。
+    // 但**一侧出错**时不能干等另一侧：连接已经废了，另一侧会一直挂着。
+    let mut up_fut = Box::pin(async {
         let r = tokio::io::copy(&mut a_read, &mut b_write).await;
         let _ = b_write.shutdown().await;
-        r
-    };
-    let down = async {
+        r.map(|_| ())
+    });
+    let mut down_fut = Box::pin(async {
         let r = tokio::io::copy(&mut b_read, &mut a_write).await;
         let _ = a_write.shutdown().await;
-        r
-    };
+        r.map(|_| ())
+    });
 
-    let (r1, r2) = tokio::join!(up, down);
-    match (r1, r2) {
-        (Ok(_), Ok(_)) => Ok(()),
-        (Err(e), _) | (_, Err(e)) => Err(e),
+    let mut up_done = false;
+    let mut down_done = false;
+    loop {
+        tokio::select! {
+            r = &mut up_fut, if !up_done => {
+                up_done = true;
+                r?;
+                if down_done { return Ok(()); }
+            }
+            r = &mut down_fut, if !down_done => {
+                down_done = true;
+                r?;
+                if up_done { return Ok(()); }
+            }
+        }
     }
 }
 

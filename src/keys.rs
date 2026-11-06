@@ -7,6 +7,7 @@
 use std::{
     io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 use anyhow::Context;
@@ -44,15 +45,29 @@ pub fn load_or_create_secret_key(path: &Path) -> anyhow::Result<SecretKey> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).ok();
     }
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(key),
-        Err(e) => {
+    // 用 hard_link 而不是 rename 来「只创建一次」：
+    // rename 会**覆盖**已存在的目标（Windows 上 rename 直接失败，Unix 上直接覆盖），
+    // 两个进程同时启动时会出现「各自持有不同的私钥、磁盘上只剩其中一个」。
+    // hard_link 在目标已存在时会失败，于是只有一个进程能创建成功，
+    // 另一个回退到读取磁盘上已经写好的那份 —— 两边拿到同一个私钥。
+    match std::fs::hard_link(&tmp, path) {
+        Ok(()) => {
             let _ = std::fs::remove_file(&tmp);
-            // 可能是另一个进程抢先创建了 → 重新读一次。
+            Ok(key)
+        }
+        Err(_e) => {
             if path.exists() {
+                // 另一个进程抢先创建了 → 用磁盘上那份。
+                let _ = std::fs::remove_file(&tmp);
                 return read_secret_key(path);
             }
-            Err(e).with_context(|| format!("保存密钥失败: {}", path.display()))
+            // 目标不存在但 hard_link 失败 → 文件系统可能不支持硬链接（例如 FAT32），
+            // 退回 rename。
+            let _ = std::fs::remove_file(&tmp);
+            match std::fs::rename(&tmp, path) {
+                Ok(()) => Ok(key),
+                Err(e) => Err(e).with_context(|| format!("保存密钥失败: {}", path.display())),
+            }
         }
     }
 }
@@ -90,12 +105,17 @@ pub fn write_endpoint_id_hint(path: &Path, id: EndpointId) -> anyhow::Result<()>
 }
 
 /// 与目标文件同目录的临时文件名。
+///
+/// 名字里必须带**进程内唯一**的序号：只用 pid 的话，同一进程里的两个线程
+/// 会写到同一个临时文件上，互相覆盖 —— 并发创建就会得到两份不同的私钥。
 fn tmp_sibling(path: &Path) -> PathBuf {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let name = path
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "server.key".to_string());
-    let tmp_name = format!(".{name}.tmp{}", std::process::id());
+    let tmp_name = format!(".{name}.tmp{}-{n}", std::process::id());
     match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.join(tmp_name),
         _ => PathBuf::from(tmp_name),
@@ -166,6 +186,29 @@ mod tests {
             err.contains("32"),
             "错误信息应说明期望 32 字节，实际: {err}"
         );
+    }
+
+    #[test]
+    fn concurrent_creation_yields_the_same_key() {
+        let dir = temp_dir("concurrent");
+        let path = dir.join("server.key");
+
+        // 两个线程同时创建同一份密钥。
+        let p1 = path.clone();
+        let p2 = path.clone();
+        let t1 = std::thread::spawn(move || load_or_create_secret_key(&p1).unwrap());
+        let t2 = std::thread::spawn(move || load_or_create_secret_key(&p2).unwrap());
+        let k1 = t1.join().unwrap();
+        let k2 = t2.join().unwrap();
+
+        assert_eq!(
+            k1.public(),
+            k2.public(),
+            "并发创建必须得到同一个 endpoint id，否则磁盘上的密钥与内存里的对不上"
+        );
+        // 磁盘上的内容必须与返回的密钥一致。
+        let on_disk = read_secret_key(&path).unwrap();
+        assert_eq!(on_disk.public(), k1.public());
     }
 
     #[test]

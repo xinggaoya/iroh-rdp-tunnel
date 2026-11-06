@@ -17,6 +17,7 @@ use crate::{
     config::ClientConfig,
     connmgr::ConnManager,
     endpoint::{EndpointOptions, bind_resolver_only},
+    keys::{load_or_create_secret_key, write_endpoint_id_hint},
     tunnel::bridge_tcp_to_quic,
 };
 
@@ -25,8 +26,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 运行控制端。
 pub async fn run(cfg: ClientConfig) -> Result<()> {
+    // 控制端也持久化自己的私钥：id 固定之后才能写进被控端的 `--allow` 白名单。
+    let secret_key = load_or_create_secret_key(&cfg.key_file)?;
+    let local_id = secret_key.public();
+
     let endpoint = bind_resolver_only(EndpointOptions {
-        secret_key: None,
+        secret_key: Some(secret_key),
         relay_mode: cfg.relay_mode.clone(),
         publish: crate::addrpolicy::PublishPolicy::RelayOnly,
         discovery: cfg.discovery,
@@ -35,8 +40,11 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
     })
     .await?;
 
+    // 把本机 id 也写成纯文本，方便复制到被控端的 --allow。
+    let _ = write_endpoint_id_hint(&cfg.key_file, local_id);
+
     // 后台立即开始建连（打洞也随之开始），不等到用户打开 mstsc。
-    let mgr = ConnManager::start(endpoint, cfg.remote);
+    let mgr = ConnManager::start(endpoint.clone(), cfg.remote);
 
     let listener = TcpListener::bind(cfg.listen)
         .await
@@ -47,6 +55,8 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
     println!(" iroh-rdp-tunnel CLIENT  ({BUILD_TAG})");
     println!("=========================================================");
     println!(" 远端 endpoint : {}", cfg.remote);
+    println!(" 本机 endpoint : {local_id}");
+    println!("                 （可写进被控端的 --allow 白名单）");
     println!(" 本地 TCP 监听 : {}", cfg.listen);
     println!();
     println!(" 正在与远端建立连接…");
@@ -58,6 +68,24 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
     println!(" (Ctrl-C 退出)");
     println!();
 
+    // Ctrl-C 时优雅关闭端点（否则 iroh 会报
+    // "Endpoint dropped without calling close()"）。
+    tokio::select! {
+        r = serve_local(mgr, listener) => r,
+        r = tokio::signal::ctrl_c() => {
+            r?;
+            println!("\n正在关闭…");
+            endpoint.close().await;
+            Ok(())
+        }
+    }
+}
+
+/// 监听本地 TCP 端口，把每个进来的连接桥接到远端。
+///
+/// 抽出来是为了让集成测试能驱动**与生产完全相同**的这条路径
+/// （本地 TCP → 常驻 QUIC 连接 → 远端）。
+pub async fn serve_local(mgr: ConnManager, listener: TcpListener) -> Result<()> {
     loop {
         let (tcp, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -78,9 +106,19 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
 }
 
 /// 把一条本地 TCP 连接桥接到远端。
-async fn handle_session(mgr: ConnManager, local: TcpStream) -> Result<()> {
+pub async fn handle_session(mgr: ConnManager, local: TcpStream) -> Result<()> {
     let conn = mgr.connection(CONNECT_TIMEOUT).await?;
-    let (send, recv) = conn.open_bi().await.context("无法打开 QUIC 双向流")?;
+    // 连接可能刚好在这一瞬间断开，open_bi 会失败 —— 换一条新连接重试一次。
+    let (send, recv) = match conn.open_bi().await {
+        Ok(s) => s,
+        Err(first) => {
+            tracing::warn!("打开 QUIC 双向流失败（连接可能刚断开）: {first}，重试一次");
+            let conn = mgr.connection(CONNECT_TIMEOUT).await?;
+            conn.open_bi()
+                .await
+                .context("重试后仍无法打开 QUIC 双向流")?
+        }
+    };
     bridge_tcp_to_quic(local, send, recv)
         .await
         .context("桥接失败")?;

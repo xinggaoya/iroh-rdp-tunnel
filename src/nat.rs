@@ -68,10 +68,28 @@ pub struct NatProfile {
 
 /// 从 iroh 的 net report 解析 NAT 画像。
 pub fn profile_from_report(report: &NetReport, pm: PortMappingStatus) -> NatProfile {
-    let mapping = match report.mapping_varies_by_dest() {
-        Some(false) => MappingBehavior::EndpointIndependent,
-        Some(true) => MappingBehavior::Symmetric,
-        None => MappingBehavior::Unknown,
+    // 优先看 IPv4：`Report::mapping_varies_by_dest()` 会把 v4/v6 用 `||` 合并，
+    // 「v4 是 EIM、v6 是对称」会被合并成「对称」。而本机（以及绝大多数 IPv4 出口）
+    // 的实际流量走 IPv4，所以以 IPv4 的结论为准。
+    let mapping = match (
+        report.mapping_varies_by_dest_ipv4,
+        report.mapping_varies_by_dest_ipv6,
+    ) {
+        (Some(v4), _) => {
+            if v4 {
+                MappingBehavior::Symmetric
+            } else {
+                MappingBehavior::EndpointIndependent
+            }
+        }
+        (None, Some(v6)) => {
+            if v6 {
+                MappingBehavior::Symmetric
+            } else {
+                MappingBehavior::EndpointIndependent
+            }
+        }
+        (None, None) => MappingBehavior::Unknown,
     };
 
     // 同一个中继可能被多种探针测到，只保留最快的那个延迟。
@@ -102,10 +120,43 @@ pub fn profile_from_report(report: &NetReport, pm: PortMappingStatus) -> NatProf
     }
 }
 
+/// 直连预期。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expectation {
+    /// 预期能 P2P 直连。
+    Direct,
+    /// 预期只能走中继。
+    RelayOnly,
+    /// 未能判定（探测未完成或映射行为未知）。
+    Unknown,
+}
+
+impl Expectation {
+    /// 一句话结论。
+    pub fn headline(self) -> &'static str {
+        match self {
+            Expectation::Direct => "✅ 具备 P2P 直连条件",
+            Expectation::RelayOnly => "❌ 直连条件不足，预计只能走中继",
+            Expectation::Unknown => "⚠️ 未能判定 —— 探测可能未完成，请重跑 irt diag",
+        }
+    }
+
+    /// 机器可读的名字。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Expectation::Direct => "direct",
+            Expectation::RelayOnly => "relay-only",
+            Expectation::Unknown => "unknown",
+        }
+    }
+}
+
 /// 判定结论。
 #[derive(Debug, Clone)]
 pub struct Verdict {
-    /// 是否预期能 P2P 直连。
+    /// 直连预期。
+    pub expectation: Expectation,
+    /// 是否预期能 P2P 直连（`Expectation::Unknown` 时为 false）。
     pub ok: bool,
     /// 一句话结论。
     pub headline: String,
@@ -120,12 +171,12 @@ pub fn verdict(profile: &NatProfile) -> Verdict {
     let mut reasons = Vec::new();
     let mut advice = Vec::new();
 
-    let ok = match profile.mapping {
+    let expectation = match profile.mapping {
         MappingBehavior::EndpointIndependent => {
             reasons.push(
                 "映射为 EIM（端点无关映射）⇒ 公网端点稳定，可通告，对端能对上号".into(),
             );
-            true
+            Expectation::Direct
         }
         MappingBehavior::Symmetric => {
             reasons.push(
@@ -135,14 +186,15 @@ pub fn verdict(profile: &NatProfile) -> Verdict {
                 "只能走中继；或在光猫上手工把内网 UDP 端口固定转发出去（消除对称 NAT 的影响）"
                     .into(),
             );
-            false
+            Expectation::RelayOnly
         }
         MappingBehavior::Unknown => {
             reasons.push("未能判定 NAT 映射行为（探测可能未完成）".into());
             advice.push("重跑 irt diag；若始终未知，可用 netdiag/nat.js 交叉验证".into());
-            false
+            Expectation::Unknown
         }
     };
+    let ok = expectation == Expectation::Direct;
 
     reasons.push(
         "iroh 的打洞走「双方同时发包」，不需要 NAT 放行任意来源的入站 UDP ⇒ 地址依赖过滤不阻断直连"
@@ -187,12 +239,9 @@ pub fn verdict(profile: &NatProfile) -> Verdict {
     advice.push("连接后看 client 输出是否出现「✅ 已切换到直连」".into());
 
     Verdict {
+        expectation,
         ok,
-        headline: if ok {
-            "✅ 具备 P2P 直连条件".to_string()
-        } else {
-            "❌ 直连条件不足，预计只能走中继".to_string()
-        },
+        headline: expectation.headline().to_string(),
         reasons,
         advice,
     }
@@ -238,6 +287,26 @@ mod tests {
     }
 
     #[test]
+    fn ipv4_mapping_wins_over_ipv6() {
+        // v4 是 EIM、v6 是对称 —— 合并判断会得出「对称」，
+        // 但实际流量走 IPv4，结论应当是 EIM。
+        let mut r = NetReport::default();
+        r.mapping_varies_by_dest_ipv4 = Some(false);
+        r.mapping_varies_by_dest_ipv6 = Some(true);
+        let p = profile_from_report(&r, PortMappingStatus::Unsupported);
+        assert_eq!(p.mapping, MappingBehavior::EndpointIndependent);
+    }
+
+    #[test]
+    fn ipv6_is_used_when_ipv4_is_unknown() {
+        let mut r = NetReport::default();
+        r.mapping_varies_by_dest_ipv4 = None;
+        r.mapping_varies_by_dest_ipv6 = Some(false);
+        let p = profile_from_report(&r, PortMappingStatus::Unsupported);
+        assert_eq!(p.mapping, MappingBehavior::EndpointIndependent);
+    }
+
+    #[test]
     fn verdict_is_ok_for_eim() {
         let v = verdict(&profile(Some(false)));
         assert!(v.ok, "EIM 下应判定可直连，实际: {:?}", v.reasons);
@@ -260,6 +329,29 @@ mod tests {
     fn verdict_is_not_ok_for_unknown() {
         let v = verdict(&profile(None));
         assert!(!v.ok);
+    }
+
+    #[test]
+    fn unknown_is_not_reported_as_a_hard_failure() {
+        let v = verdict(&profile(None));
+        assert_eq!(v.expectation, Expectation::Unknown);
+        assert!(
+            v.headline.contains("未能判定"),
+            "未知不应被渲染成硬失败，实际: {}",
+            v.headline
+        );
+        assert!(
+            !v.headline.contains("❌"),
+            "未知不应带 ❌，实际: {}",
+            v.headline
+        );
+    }
+
+    #[test]
+    fn expectation_headlines_are_distinct() {
+        assert!(Expectation::Direct.headline().contains("✅"));
+        assert!(Expectation::RelayOnly.headline().contains("❌"));
+        assert!(Expectation::Unknown.headline().contains("⚠"));
     }
 
     #[test]

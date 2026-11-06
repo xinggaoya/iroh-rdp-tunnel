@@ -79,6 +79,9 @@ server 公布 relay URL（iroh 标准：AddrFilter::relay_only）
 | D10 | **新增 `Discovery` 开关（Public / Disabled）** | 集成测试要能**关掉公共 pkarr / DNS**，否则测试依赖外网、还会把临时 endpoint id 往公共 pkarr 上写；自建 relay 场景同样需要 | 沿用 `presets::N0` 无法关掉发现服务 —— 实施阶段发现的问题 |
 | D11 | **中继 TLS 信任用「传入 CA 配置」而不是「跳过校验」** | `CaTlsConfig::insecure_skip_verify()` 受 iroh-relay 的 `test-utils` feature 门控，**生产构建里根本不存在**；而且「跳过校验」本身是安全陷脚 | 一开始想加 `--insecure-relay` 开关，release 编译失败后改为 `--ca-file <PEM>` —— 正确的做法 |
 | D12 | **路径事件流在 spawn 之前订阅** | 事件流是广播通道，晚订阅会丢掉「中继 → 直连」的迁移事件 —— 而那正是用户最想看到的一行 | 先在任务内部订阅，实测漏掉了迁移 —— 实施阶段发现的问题 |
+| D13 | **endpoint id 解析前统一转小写** | iroh 的十六进制解码器只认小写（HEXLOWER），但用户复制来的 id 很可能带大写字母 —— Review Focus 明确点名了这一项 | 直接交给 iroh 解析，大写 id 会报「不是合法的 endpoint id」 |
+| D14 | **防火墙检测按**路径**匹配，不解析 netsh 的标签名** | netsh 输出是**本地化**的（中文 Windows 上是「程序:」），而且非 verbose 模式根本没有程序路径行；路径本身不本地化 | 解析标签名（初版做法）→ 在中文 Windows 上 100% 误报 |
+| D15 | **防火墙检测查**全部**规则，而不是只查我们自己的规则名** | Windows 会为监听端口的程序自动创建一条以 exe 文件名命名的入站 UDP 放行规则 —— 那条同样有效 | 只查 `RULE_NAME` → 明明已经放行了却一直提示「未检测到」 |
 
 ---
 
@@ -512,6 +515,28 @@ irt diag [--json]
 5. **M5 体检**：`nat` + `portmap` + `irt diag` + JSON 输出
 6. **M6 文档**：README 重写（实测网络画像 / 机制说明 / 排障决策树）+ DESIGN 同步
 7. **M7 验证**：`cargo test` + 集成测试 + 真实公网 P2P 验收
+
+---
+
+## 10.5 评审修复（分支末端评审发现的问题）
+
+整分支评审发现 4 个阻塞项与若干重要项，全部已修：
+
+| 编号 | 问题 | 修复 |
+|---|---|---|
+| C1 | `irt server --no-relay` 永久挂起、连 endpoint id 都不打印（`online()` 在 `RelayMode::Disabled` 下永不返回） | banner 拆成「立即打印」与「网络信息」两段；`online()` 加 15 秒超时；`RelayMode::Disabled` 直接跳过等待 |
+| I1 | 防火墙自检 100% 误报（netsh 非 verbose 无程序行 + 标签本地化） | 改用 `verbose`；按**路径**匹配整段输出；查全部规则（覆盖 Windows 自动创建的规则）；新增 `FirewallStatus::NotApplicable` |
+| I2 | `irt diag` 在 relay 不可达时无限挂起 | `online()` 与端口映射探测都加超时 |
+| I3 | client 不打印自身 endpoint id，`--allow` 白名单实际不可用 | client 也持久化私钥（默认 `client.key`）并打印「本机 endpoint」；`ConnManager` 支持显式指定远端地址 |
+| I4 | 大写十六进制 endpoint id 解析失败 | 解析前统一转小写（`parse_endpoint_id`） |
+| I5 | 「未知」被渲染成硬失败（❌） | 新增 `Expectation` 枚举，`Unknown` 单独渲染成 ⚠️ |
+| I6 | `ConnManager` 可能返回已死连接 | `connection()` 跳过 `close_reason()` 非空的连接；`open_bi` 失败重试一次 |
+| I7 | Windows 上 `rename` 覆盖导致并发启动时 endpoint id 不固定 | 改用 `hard_link`（目标已存在则失败 → 读磁盘上那份）；临时文件名加进程内唯一序号 |
+| I8 | e2e 注释与实现不符，client 侧桥接零覆盖 | 抽出 `commands::client::serve_local`；新增 `client_local_tcp_path_roundtrips` 用例，走**与生产完全相同**的路径 |
+| I9 | RDP 拨号失败会拆掉整条 QUIC 连接 | 改为只 `reset` 当前这一条流 |
+| M4 | 「本机公网端点」标签把所有网卡地址都叫公网 | 改为「本机地址」并区分 (公网)/(私网) |
+| M6 | `mapping_varies_by_dest()` 把 v4/v6 用 `||` 合并 | 改为优先看 IPv4 |
+| M15 | 桥接一侧出错时另一侧一直挂着 | 改为 `select!`：一侧出错立即结束另一侧；EOF 半关闭语义保持不变 |
 
 ---
 

@@ -32,35 +32,27 @@ pub fn add_rule_args(exe: &Path, rule_name: &str) -> Vec<String> {
     ]
 }
 
-/// 判断 `netsh advfirewall firewall show rule` 的输出里是否有一条指向该 exe 的规则。
+/// 判断 `netsh advfirewall firewall show rule ... verbose` 的输出里是否有指向该 exe 的规则。
 ///
-/// Windows 路径不区分大小写，netsh 也可能改写路径分隔符，所以两边都做归一化再比较。
+/// **不解析标签名**：netsh 的输出是本地化的（中文 Windows 上是「程序:」而不是
+/// 「Program:」），标签名会变；而且非 verbose 模式下根本没有程序路径行。
+/// 改成：把整段输出归一化后，看有没有包含归一化后的 exe 路径 —— 路径本身不本地化。
 pub fn output_has_rule(output: &str, exe: &Path) -> bool {
-    let want = normalize_path(&exe.display().to_string());
+    let want = normalize_exe(&exe.display().to_string());
     if want.is_empty() {
         return false;
     }
-    output
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            let lower = line.to_ascii_lowercase();
-            if !lower.starts_with("program") {
-                return None;
-            }
-            // 形如：Program: C:\path\to\irt.exe
-            let (_, value) = line.split_once(':')?;
-            Some(normalize_path(value.trim()))
-        })
-        .any(|got| got == want)
+    normalize_path(output).contains(&want)
 }
 
-/// 归一化路径用于比较：统一分隔符、转小写、去掉尾部反斜杠。
+/// 归一化一段文本用于路径比较：统一分隔符、转小写、去掉首尾空白与引号。
 fn normalize_path(s: &str) -> String {
-    let s = s.trim().trim_matches('"');
-    let s = s.replace('/', "\\");
-    let s = s.trim_end_matches('\\').to_ascii_lowercase();
-    s
+    s.trim().trim_matches('"').replace('/', "\\").to_ascii_lowercase()
+}
+
+/// 归一化一个可执行文件路径用于比较。
+fn normalize_exe(s: &str) -> String {
+    normalize_path(s).trim_end_matches('\\').to_string()
 }
 
 /// 防火墙放行状态。
@@ -72,14 +64,33 @@ pub enum FirewallStatus {
     Missing,
     /// 检测失败（例如没有权限读防火墙配置）。
     Unknown,
+    /// 该平台不适用（Windows 之外）。
+    NotApplicable,
 }
 
 /// 检测当前 exe 的防火墙放行状态。
+///
+/// 查**全部**规则而不是只查我们自己的规则名：Windows 会为正在监听端口的程序
+/// 自动创建一条以 exe 文件名命名的入站放行规则（方向=入，协议=UDP，操作=允许），
+/// 那条规则同样能让打洞成功。
 pub fn status(exe: &Path) -> FirewallStatus {
-    if has_allow_rule(exe, RULE_NAME) {
-        FirewallStatus::Allowed
-    } else {
-        FirewallStatus::Missing
+    #[cfg(windows)]
+    {
+        match show_rules_verbose("all") {
+            Ok(out) => {
+                if output_has_rule(&out, exe) {
+                    FirewallStatus::Allowed
+                } else {
+                    FirewallStatus::Missing
+                }
+            }
+            Err(_) => FirewallStatus::Unknown,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = exe;
+        FirewallStatus::NotApplicable
     }
 }
 
@@ -91,6 +102,7 @@ pub fn status_hint(status: FirewallStatus) -> String {
         FirewallStatus::Unknown => {
             "？无法检测防火墙规则状态（可能没有读取权限）".to_string()
         }
+        FirewallStatus::NotApplicable => "（非 Windows 平台，不适用）".to_string(),
     }
 }
 
@@ -99,14 +111,36 @@ pub fn current_exe() -> Result<std::path::PathBuf> {
     std::env::current_exe().context("无法获取当前可执行文件路径")
 }
 
+/// 查询 netsh 的规则列表（verbose 模式，含程序路径）。
+///
+/// 必须用 `verbose`：非 verbose 的输出里没有程序路径行。
+#[cfg(windows)]
+fn show_rules_verbose(rule_name: &str) -> anyhow::Result<String> {
+    let output = Command::new("netsh")
+        .args([
+            "advfirewall",
+            "firewall",
+            "show",
+            "rule",
+            &format!("name={rule_name}"),
+            "verbose",
+        ])
+        .output()
+        .context("调用 netsh 失败")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "netsh 查询规则失败: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 /// 检测是否已存在指向该 exe 的放行规则。
 #[cfg(windows)]
 pub fn has_allow_rule(exe: &Path, rule_name: &str) -> bool {
-    let output = Command::new("netsh")
-        .args(["advfirewall", "firewall", "show", "rule", &format!("name={rule_name}")])
-        .output();
-    match output {
-        Ok(out) => output_has_rule(&String::from_utf8_lossy(&out.stdout), exe),
+    match show_rules_verbose(rule_name) {
+        Ok(out) => output_has_rule(&out, exe),
         Err(_) => false,
     }
 }
@@ -213,26 +247,35 @@ mod tests {
     }
 
     #[test]
-    fn output_has_rule_matches_the_program_line() {
+    fn output_has_rule_matches_the_program_path() {
+        let exe = Path::new(r"C:\Program Files\irt\irt.exe");
+        let output = "规则名称:                             irt UDP inbound\n\
+                      ----------------------------------------------------------------------\n\
+                      程序:                                 C:\\Program Files\\irt\\irt.exe\n\
+                      方向:                                 入\n\
+                      操作:                                 允许\n";
+        assert!(output_has_rule(output, exe));
+    }
+
+    #[test]
+    fn output_has_rule_works_with_english_labels() {
         let exe = Path::new(r"C:\Program Files\irt\irt.exe");
         let output = "Rule Name:                            irt UDP inbound\n\
-                      ----------------------------------------------------------------------\n\
-                      Program:                              C:\\Program Files\\irt\\irt.exe\n\
-                      Enabled:                              Yes\n";
+                      Program:                              C:\\Program Files\\irt\\irt.exe\n";
         assert!(output_has_rule(output, exe));
     }
 
     #[test]
     fn output_has_rule_is_case_insensitive() {
         let exe = Path::new(r"C:\Program Files\irt\irt.exe");
-        let output = "Program:                              c:\\program files\\irt\\irt.exe\n";
+        let output = "程序:                                 c:\\program files\\irt\\irt.exe\n";
         assert!(output_has_rule(output, exe));
     }
 
     #[test]
     fn output_has_rule_ignores_other_programs() {
         let exe = Path::new(r"C:\Program Files\irt\irt.exe");
-        let output = "Program:                              C:\\Windows\\System32\\svchost.exe\n";
+        let output = "程序:                                 C:\\Windows\\System32\\svchost.exe\n";
         assert!(!output_has_rule(output, exe));
     }
 
@@ -240,6 +283,29 @@ mod tests {
     fn output_has_rule_handles_empty_output() {
         let exe = Path::new(r"C:\Program Files\irt\irt.exe");
         assert!(!output_has_rule("", exe));
+    }
+
+    #[test]
+    fn output_has_rule_handles_windows_auto_created_rule() {
+        // Windows 会为监听端口的程序自动创建一条以 exe 文件名命名的入站放行规则，
+        // 规则名与我们的 RULE_NAME 不同 —— 所以必须按**路径**匹配而不是按规则名。
+        let exe = Path::new(r"C:\users\me\irt\target\release\irt.exe");
+        let output = "规则名称:                             irt.exe\n\
+                      程序:                                 C:\\users\\me\\irt\\target\\release\\irt.exe\n\
+                      协议:                                 UDP\n\
+                      方向:                                 入\n\
+                      操作:                                 允许\n";
+        assert!(output_has_rule(output, exe));
+    }
+
+    #[test]
+    fn output_has_rule_does_not_match_a_different_build_path() {
+        // debug 与 release 是两个不同的 exe，规则不能互相顶替。
+        let release = Path::new(r"C:\irt\target\release\irt.exe");
+        let debug = Path::new(r"C:\irt\target\debug\irt.exe");
+        let output = "程序:                                 C:\\irt\\target\\debug\\irt.exe\n";
+        assert!(output_has_rule(output, debug));
+        assert!(!output_has_rule(output, release));
     }
 
     #[cfg(not(windows))]
@@ -281,5 +347,8 @@ mod tests {
 
         let unknown = status_hint(FirewallStatus::Unknown);
         assert!(unknown.contains("无法检测"), "实际: {unknown}");
+
+        let na = status_hint(FirewallStatus::NotApplicable);
+        assert!(na.contains("不适用"), "实际: {na}");
     }
 }

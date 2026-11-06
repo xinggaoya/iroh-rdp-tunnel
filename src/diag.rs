@@ -4,6 +4,12 @@ use serde::Serialize;
 
 use crate::nat::{NatProfile, Verdict};
 
+/// NAT 过滤行为 —— iroh 的 net report **测不了**，如实标注而不是编造。
+///
+/// 这不影响结论：iroh 的打洞走「双方同时发包」，本来就不需要 NAT 放行任意来源的入站。
+pub const FILTERING_NOT_MEASURED: &str =
+    "未测量（iroh 无法直接探测；严格验证请用外部 STUN 工具）";
+
 /// 体检报告。
 #[derive(Debug, Clone)]
 pub struct DiagReport {
@@ -36,6 +42,8 @@ pub struct DiagReportJson {
     pub relay_latencies: Vec<RelayLatencyJson>,
     /// 端口映射状态。
     pub port_mapping: String,
+    /// NAT 过滤行为 —— iroh 测不了，如实标注。
+    pub filtering_behavior: String,
     /// 是否预期能 P2P 直连。
     pub p2p_direct_expected: bool,
     /// 结论标题。
@@ -81,6 +89,7 @@ impl DiagReport {
                 })
                 .collect(),
             port_mapping: self.profile.port_mapping.summary(),
+            filtering_behavior: FILTERING_NOT_MEASURED.to_string(),
             p2p_direct_expected: self.verdict.ok,
             headline: self.verdict.headline.clone(),
             reasons: self.verdict.reasons.clone(),
@@ -121,9 +130,7 @@ pub fn render(report: &DiagReport) -> String {
         }
     ));
     // 过滤行为 iroh 测不了 —— 如实标注，不编造。
-    out.push_str(
-        " NAT 过滤行为     : 未测量（iroh 无法直接探测；严格验证见 netdiag/filter-proof.js）\n",
-    );
+    out.push_str(&format!(" NAT 过滤行为     : {FILTERING_NOT_MEASURED}\n"));
     out.push_str("                   → 但这不阻断直连：iroh 的打洞走「双方同时发包」\n");
     out.push_str(&format!(
         " UDP 可用         : IPv4 {}   IPv6 {}\n",
@@ -207,7 +214,14 @@ mod tests {
             text.contains("未测量"),
             "报告必须如实标注过滤行为未测量，实际:\n{text}"
         );
-        assert!(text.contains("filter-proof.js"), "应指出严格验证方法");
+    }
+
+    #[test]
+    fn json_also_states_that_filtering_behavior_is_not_measured() {
+        let json = render_json(&sample_report());
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let v = parsed["filtering_behavior"].as_str().unwrap();
+        assert!(v.contains("未测量"), "JSON 也必须如实标注，实际: {v}");
     }
 
     #[test]

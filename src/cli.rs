@@ -111,6 +111,12 @@ pub struct ClientArgs {
     #[arg(long, value_name = "PATH")]
     pub ca_file: Option<PathBuf>,
 
+    /// 控制端自己的私钥文件路径（默认 %APPDATA%\iroh-rdp-tunnel\client.key）。
+    ///
+    /// 持久化后控制端的 endpoint id 固定，可以写进被控端的 `--allow` 白名单。
+    #[arg(long, value_name = "PATH")]
+    pub key_file: Option<PathBuf>,
+
     /// 为本程序添加入站 UDP 防火墙放行规则后退出（需管理员权限）。
     #[arg(long)]
     pub install_firewall_rule: bool,
@@ -163,11 +169,7 @@ pub fn resolve_server(args: &ServerArgs, env: &EnvSource) -> anyhow::Result<Serv
 
 /// 解析 `irt client` 的配置。
 pub fn resolve_client(args: &ClientArgs, env: &EnvSource) -> anyhow::Result<ClientConfig> {
-    let remote: EndpointId = args
-        .remote
-        .trim()
-        .parse()
-        .with_context(|| format!("不是合法的 endpoint id `{}`", args.remote))?;
+    let remote = parse_endpoint_id(&args.remote)?;
     let listen = match (&args.listen, env.get("IRT_LISTEN")) {
         (Some(v), _) => v.clone(),
         (None, Some(v)) => v.to_string(),
@@ -179,12 +181,18 @@ pub fn resolve_client(args: &ClientArgs, env: &EnvSource) -> anyhow::Result<Clie
     let relay_mode = resolve_relay_mode(args.no_relay, &args.relay, env)?;
     let discovery = resolve_discovery(args.no_discovery, env);
     let ca_tls_config = resolve_ca(args.ca_file.as_deref(), env)?;
+    let key_file = match (&args.key_file, env.get("IRT_CLIENT_KEY_FILE")) {
+        (Some(p), _) => p.clone(),
+        (None, Some(v)) => PathBuf::from(v),
+        (None, None) => crate::config::default_client_key_file(),
+    };
     Ok(ClientConfig {
         remote,
         listen,
         relay_mode,
         discovery,
         ca_tls_config,
+        key_file,
     })
 }
 
@@ -238,13 +246,17 @@ fn resolve_relay_mode(
 fn resolve_allow_list(args: &ServerArgs, env: &EnvSource) -> anyhow::Result<Vec<EndpointId>> {
     let mut raw: Vec<String> = args.allow.clone();
     raw.extend(env.get_list("IRT_ALLOW"));
-    raw.iter()
-        .map(|s| {
-            s.trim()
-                .parse::<EndpointId>()
-                .with_context(|| format!("不是合法的 endpoint id `{s}`"))
-        })
-        .collect()
+    raw.iter().map(|s| parse_endpoint_id(s)).collect()
+}
+
+/// 解析 endpoint id。
+///
+/// iroh 的十六进制解码器只认**小写**（HEXLOWER），但用户从各种渠道复制来的
+/// id 很可能带大写字母或首尾空白 —— 这里统一归一化。
+pub fn parse_endpoint_id(s: &str) -> anyhow::Result<EndpointId> {
+    let t = s.trim().to_ascii_lowercase();
+    t.parse()
+        .with_context(|| format!("不是合法的 endpoint id `{}`", s.trim()))
 }
 
 /// 地址发现：CLI `--no-discovery` / `IRT_NO_DISCOVERY` > 公共 pkarr + DNS。
@@ -288,17 +300,19 @@ pub async fn run() -> anyhow::Result<()> {
     let env = EnvSource::from_process();
     match &args.command {
         Command::Server(a) => {
-            let cfg = resolve_server(a, &env)?;
+            // 防火墙开关先处理：它与连接配置无关，
+            // 不该因为别的参数写错而装不上规则。
             if handle_firewall(a.install_firewall_rule, a.uninstall_firewall_rule)? {
                 return Ok(());
             }
+            let cfg = resolve_server(a, &env)?;
             commands::server::run(cfg).await
         }
         Command::Client(a) => {
-            let cfg = resolve_client(a, &env)?;
             if handle_firewall(a.install_firewall_rule, a.uninstall_firewall_rule)? {
                 return Ok(());
             }
+            let cfg = resolve_client(a, &env)?;
             commands::client::run(cfg).await
         }
         Command::Diag(a) => commands::diag::run(a.clone()).await,
@@ -498,6 +512,49 @@ Wf86aX6PepsntZv2GYlA5UpabfT2EZICICpJ5h/iI+i341gBmLiAFQOyTDT+/wQc
     }
 
     #[test]
+    fn uppercase_endpoint_id_is_accepted() {
+        let lower = "86e9c0158a1f097baf3b17ce917501f5e4e3c244cf9cf57f39dcb187e9e09440";
+        let upper = lower.to_ascii_uppercase();
+        let a = parse_endpoint_id(lower).unwrap();
+        let b = parse_endpoint_id(&upper).unwrap();
+        assert_eq!(a, b, "大写 id 必须解析成同一个 endpoint");
+    }
+
+    #[test]
+    fn mixed_case_endpoint_id_is_accepted() {
+        let lower = "86e9c0158a1f097baf3b17ce917501f5e4e3c244cf9cf57f39dcb187e9e09440";
+        let mixed: String = lower
+            .chars()
+            .enumerate()
+            .map(|(i, c)| if i % 2 == 0 { c.to_ascii_uppercase() } else { c })
+            .collect();
+        assert_eq!(parse_endpoint_id(lower).unwrap(), parse_endpoint_id(&mixed).unwrap());
+    }
+
+    #[test]
+    fn client_uppercase_endpoint_id_is_accepted() {
+        let id = "86E9C0158A1F097BAF3B17CE917501F5E4E3C244CF9CF57F39DCB187E9E09440";
+        let args = ClientArgs {
+            remote: id.to_string(),
+            ..Default::default()
+        };
+        let cfg = resolve_client(&args, &env(&[])).unwrap();
+        assert_eq!(cfg.remote.to_string(), id.to_ascii_lowercase());
+    }
+
+    #[test]
+    fn allow_list_accepts_uppercase_ids() {
+        let id = "86E9C0158A1F097BAF3B17CE917501F5E4E3C244CF9CF57F39DCB187E9E09440";
+        let args = ServerArgs {
+            allow: vec![id.to_string()],
+            ..Default::default()
+        };
+        let cfg = resolve_server(&args, &env(&[])).unwrap();
+        assert_eq!(cfg.allow_list.len(), 1);
+        assert_eq!(cfg.allow_list[0].to_string(), id.to_ascii_lowercase());
+    }
+
+    #[test]
     fn client_invalid_endpoint_id_is_rejected_and_mentions_it() {
         let args = ClientArgs {
             remote: "not-an-id".into(),
@@ -505,6 +562,33 @@ Wf86aX6PepsntZv2GYlA5UpabfT2EZICICpJ5h/iI+i341gBmLiAFQOyTDT+/wQc
         };
         let err = resolve_client(&args, &env(&[])).unwrap_err().to_string();
         assert!(err.contains("not-an-id"), "错误信息应包含非法 id: {err}");
+    }
+
+    #[test]
+    fn client_key_file_defaults_to_a_dedicated_file() {
+        let args = ClientArgs {
+            remote: "86e9c0158a1f097baf3b17ce917501f5e4e3c244cf9cf57f39dcb187e9e09440".into(),
+            ..Default::default()
+        };
+        let cfg = resolve_client(&args, &env(&[])).unwrap();
+        assert_eq!(
+            cfg.key_file.file_name().and_then(|s| s.to_str()),
+            Some("client.key")
+        );
+    }
+
+    #[test]
+    fn client_key_file_env_overrides_default() {
+        let args = ClientArgs {
+            remote: "86e9c0158a1f097baf3b17ce917501f5e4e3c244cf9cf57f39dcb187e9e09440".into(),
+            ..Default::default()
+        };
+        let cfg = resolve_client(
+            &args,
+            &env(&[("IRT_CLIENT_KEY_FILE", "/tmp/c.key")]),
+        )
+        .unwrap();
+        assert_eq!(cfg.key_file, PathBuf::from("/tmp/c.key"));
     }
 
     #[test]

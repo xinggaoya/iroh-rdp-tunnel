@@ -20,6 +20,15 @@ use crate::{
 /// 采集网络报告的超时。
 const REPORT_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// 等 relay 连接的超时。
+///
+/// `Endpoint::online()` 是无界的：relay 不可达时它永远不会返回，
+/// 体检工具必须自己兜住这个超时。
+const RELAY_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 端口映射探测的超时。
+const PORTMAP_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// 运行网络体检。
 pub async fn run(args: DiagArgs) -> Result<()> {
     // 端口映射探测与 net report 互不依赖，并行跑。
@@ -50,17 +59,27 @@ pub async fn run(args: DiagArgs) -> Result<()> {
     };
 
     // 等端点连上中继，再读实际选定的 home relay —— 那才是流量真正会走的中继。
-    endpoint.online().await;
-    let home_relay = endpoint
-        .home_relay_status()
-        .get()
-        .into_iter()
-        .find(|s| s.is_connected())
-        .map(|s| s.url().clone());
+    // online() 是无界的，必须自己套超时。
+    let home_relay = match tokio::time::timeout(RELAY_WAIT_TIMEOUT, endpoint.online()).await {
+        Ok(()) => endpoint
+            .home_relay_status()
+            .get()
+            .into_iter()
+            .find(|s| s.is_connected())
+            .map(|s| s.url().clone()),
+        Err(_) => {
+            eprintln!(
+                "⚠ {} 秒内未连上 relay —— home relay 未知（NAT 画像与直连判定仍然有效）",
+                RELAY_WAIT_TIMEOUT.as_secs()
+            );
+            None
+        }
+    };
 
-    let pm = match pm_task.await {
-        Ok(status) => status,
-        Err(e) => PortMappingStatus::ProbeFailed(format!("探测任务异常结束: {e}")),
+    let pm = match tokio::time::timeout(PORTMAP_TIMEOUT, pm_task).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => PortMappingStatus::ProbeFailed(format!("探测任务异常结束: {e}")),
+        Err(_) => PortMappingStatus::ProbeFailed("探测超时".to_string()),
     };
 
     let mut profile = profile_from_report(&report, pm);
