@@ -204,6 +204,11 @@ async fn run_rustp2p(cfg: ServerConfig) -> Result<()> {
     if !cfg.allow_peers.is_empty() {
         println!(" peer 白名单   : {}", cfg.allow_peers.join(", "));
         println!("                （只是字符串比对，不是身份认证）");
+        // 这个白名单会**同时**决定「谁能接入」和「rustp2p 回不回复
+        // PunchReply」—— 而对端正是靠那个回复来确认直连路由。
+        // 对端 peer id 默认随机生成 ⇒ 匹配不上 ⇒ 直连永远建不起来。
+        println!("                ⚠ 对端必须用 --node-id 固定 peer id 才能匹配上");
+        println!("                  否则直连打不通（会一直握手超时）");
     }
     println!(" 本机 RDP     : {}", cfg.rdp_target);
     println!();
