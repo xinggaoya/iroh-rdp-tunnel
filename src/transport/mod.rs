@@ -30,6 +30,7 @@ use tokio::sync::broadcast;
 use crate::pathinfo::{PathInfo, PathKind};
 
 pub mod iroh;
+pub mod rustp2p;
 
 /// iroh 的 endpoint id（公钥指纹）。
 ///

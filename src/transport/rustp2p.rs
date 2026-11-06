@@ -1,0 +1,537 @@
+//! rustp2p-quic 后端的传输层适配器。
+//!
+//! # 为什么是第二个后端
+//!
+//! iroh 的打洞候选**只**来自 QAD（中继观测到的端点）。在**对称 NAT**
+//! （映射随目标变化）下，中继看到的端口与对端真实可达端口对不上号，
+//! 打洞**永远**打不通 —— 这是架构性限制，改配置没用。
+//!
+//! rustp2p-quic 用「端口预测 + 全局随机扫描」正面解决对称 NAT，
+//! 而且它的中继是 mesh 模型的：只转发密文、不终结 TLS，
+//! 所以**不需要**专门的中继服务端，一个 node 同时当 bootstrap 与中继即可。
+//!
+//! # 字节流适配
+//!
+//! rustp2p-quic 的 `ReliableSendStream` / `ReliableRecvStream` 只暴露了
+//! async 便捷方法（`write_all` / `read` / `finish`），**没有** poll 级 API，
+//! 底层的 quinn 流字段也是私有的。而 Tokio 的 `AsyncRead` / `AsyncWrite`
+//! 是 poll 级的 —— 所以这里用一个「后台任务 + channel」的适配层把它们桥起来。
+//!
+//! 语义要点：
+//!
+//! - **写**：数据交给后台任务，由它按序调用 `write_all`。
+//!   背压靠有界 channel 实现：流控窗口满时后台任务卡住 → channel 满 →
+//!   `poll_write` 返回 `Pending`。
+//! - **读**：后台任务循环 `read`，把每个 chunk 送进 channel；
+//!   `poll_read` 先从本地缓冲取，取不到再等 channel。
+//! - **半关闭**：`poll_shutdown` 发 `Finish` 命令，让后台任务 `finish()`
+//!   掉写半边 —— RDP 依赖 TCP 的 FIN 判定流结束，这一步不能省。
+
+use std::future::Future;
+use std::io;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+
+use anyhow::Result;
+use rustp2p_quic::{Endpoint, Identity, PeerId};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::{broadcast, mpsc, oneshot};
+
+use crate::{
+    transport::{
+        AcceptedStream, AsyncStream, PathState, PeerRef, TransportEndpoint, TransportEvent,
+        TransportKind,
+    },
+};
+
+/// 事件广播通道的容量。
+const EVENT_CHANNEL_CAPACITY: usize = 32;
+
+/// 写命令通道的容量。
+///
+/// 容量小是为了尽快把背压传回上层：quinn 的流控窗口满时，
+/// 后台任务会卡在 `write_all` 上，channel 随之填满。
+const WRITE_CHANNEL_CAPACITY: usize = 2;
+
+/// 读通道的容量。
+const READ_CHANNEL_CAPACITY: usize = 8;
+
+/// 后台读任务每次读取的块大小。
+const READ_CHUNK: usize = 16 * 1024;
+
+/// 路径状态的轮询间隔。
+const PATH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// rustp2p 传输端点的配置。
+#[derive(Debug, Clone)]
+pub struct Rustp2pOptions {
+    /// 本端 peer id（任意字符串）。
+    pub peer_id: String,
+    /// 证书种子 —— **必须持久化**，否则重启后身份会变。
+    pub seed: String,
+    /// 本地监听地址。
+    pub bind: SocketAddr,
+    /// bootstrap 节点地址（公网 VPS 上的 node）。
+    pub bootstrap: Vec<SocketAddr>,
+    /// STUN 服务器列表。
+    pub stun_servers: Vec<String>,
+    /// 辅助打洞 socket 数量 —— 对称 NAT 下必须 > 0。
+    pub max_assistant_sockets: usize,
+    /// 允许参与打洞的 peer 白名单；`None` 表示不限制。
+    pub punch_whitelist: Option<Vec<String>>,
+}
+
+impl Default for Rustp2pOptions {
+    fn default() -> Self {
+        Self {
+            peer_id: "irt-node".to_string(),
+            seed: "irt-node-seed".to_string(),
+            bind: "0.0.0.0:0".parse().expect("固定地址可解析"),
+            bootstrap: Vec::new(),
+            stun_servers: Vec::new(),
+            max_assistant_sockets: 4,
+            punch_whitelist: None,
+        }
+    }
+}
+
+/// rustp2p 传输端点。
+pub struct Rustp2pTransport {
+    /// 底层 rustp2p 端点。
+    endpoint: Endpoint,
+    /// 路径事件广播通道。
+    events: broadcast::Sender<TransportEvent>,
+    /// 当前路径状态。
+    state: Arc<Mutex<PathState>>,
+    /// server 侧的入站流队列。
+    incoming: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Result<AcceptedStream>>>>,
+    /// 关注的 peer（路径轮询用）。
+    ///
+    /// 用 `Arc<Mutex<..>>` 而不是普通 Vec —— server 侧在收到入站流时
+    /// 会动态加入新的对端，轮询任务必须能看见。
+    watched: Arc<Mutex<Vec<PeerId>>>,
+}
+
+impl Rustp2pTransport {
+    /// 按配置建立一个 rustp2p 端点。
+    ///
+    /// `watched` 是需要持续观察路径的 peer 列表：
+    /// client 侧是远端，server 侧由 [`Self::watch_peer`] 动态加入。
+    pub async fn build(
+        opts: &Rustp2pOptions,
+        watched: Vec<PeerId>,
+    ) -> Result<Arc<Self>> {
+        let identity = Identity::new(opts.peer_id.clone(), opts.seed.as_bytes())
+            .map_err(|e| anyhow::anyhow!("创建 rustp2p 身份失败: {e}"))?;
+
+        let mut builder = Endpoint::builder()
+            .identity(identity)
+            .bind(opts.bind)
+            .max_assistant_sockets(opts.max_assistant_sockets);
+
+        if !opts.bootstrap.is_empty() {
+            builder = builder.bootstrap(opts.bootstrap.clone());
+        }
+        if !opts.stun_servers.is_empty() {
+            builder = builder.stun_servers(opts.stun_servers.clone());
+        }
+        if let Some(list) = &opts.punch_whitelist {
+            builder = builder.punch_whitelist(Some(list.iter().map(PeerId::new).collect()));
+        }
+
+        let endpoint = builder
+            .build()
+            .await
+            .map_err(|e| anyhow::anyhow!("绑定 rustp2p 端点失败: {e}"))?;
+
+        let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let transport = Arc::new(Self {
+            endpoint: endpoint.clone(),
+            events: events.clone(),
+            state: Arc::new(Mutex::new(PathState::Connecting)),
+            incoming: Arc::new(tokio::sync::Mutex::new(rx)),
+            watched: Arc::new(Mutex::new(watched)),
+        });
+
+        transport.spawn_accept_loop(tx);
+        transport.spawn_path_poller();
+        Ok(transport)
+    }
+
+    /// 关注一个 peer 的路径状态（server 侧在收到入站流时调用）。
+    pub fn watch_peer(&self, peer: PeerId) {
+        let mut watched = self.watched.lock().unwrap();
+        if !watched.contains(&peer) {
+            watched.push(peer);
+        }
+    }
+
+    /// 本端监听地址。
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.endpoint.local_addr()
+    }
+
+    /// 已知的 peer 列表。
+    pub fn known_peers(&self) -> Vec<PeerId> {
+        self.endpoint
+            .known_peers()
+            .into_iter()
+            .map(|p| p.peer_id)
+            .collect()
+    }
+
+    /// 后台任务：接受入站双向流。
+    fn spawn_accept_loop(self: &Arc<Self>, tx: mpsc::UnboundedSender<Result<AcceptedStream>>) {
+        let endpoint = self.endpoint.clone();
+        tokio::spawn(async move {
+            loop {
+                let incoming = match endpoint.accept_bi().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::debug!("接受入站双向流失败: {e}");
+                        // 端点关闭时 accept_bi 会一直出错 —— 退避后重试，避免空转。
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        continue;
+                    }
+                };
+                let peer = incoming.peer_id.clone();
+                tracing::info!("收到来自 {peer} 的双向流");
+                let stream = Rustp2pStream::new(incoming.send, incoming.recv);
+                if tx
+                    .send(Ok(AcceptedStream {
+                        peer: PeerRef::Rustp2p(peer.as_str().to_string()),
+                        stream: Box::new(stream),
+                    }))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// 后台任务：轮询路径状态并推到广播通道。
+    ///
+    /// rustp2p-quic 的 `link_mode()` / `link_info()` 是**同步查询**，
+    /// 没有订阅接口 —— 所以只能轮询（1 秒一次，足够及时）。
+    fn spawn_path_poller(self: &Arc<Self>) {
+        let endpoint = self.endpoint.clone();
+        let events = self.events.clone();
+        let state = self.state.clone();
+        let watched = self.watched.clone();
+
+        tokio::spawn(async move {
+            let mut last: Option<(PeerId, PathState)> = None;
+            loop {
+                tokio::time::sleep(PATH_POLL_INTERVAL).await;
+
+                // 关注的 peer 列表 + 已知 peer（server 侧的对端是动态出现的）。
+                let mut peers = watched.lock().unwrap().clone();
+                for p in endpoint.known_peers() {
+                    if !peers.contains(&p.peer_id) {
+                        peers.push(p.peer_id);
+                    }
+                }
+
+                for peer in &peers {
+                    let Some(info) = endpoint.link_info(peer.clone()) else {
+                        continue;
+                    };
+                    let routes = endpoint.routes(peer.clone());
+                    let current = match info.mode {
+                        rustp2p_quic::LinkMode::Direct => PathState::Direct {
+                            remote: routes
+                                .first()
+                                .map(|r| r.route_key().peer_addr().to_string())
+                                .unwrap_or_else(|| peer.as_str().to_string()),
+                            rtt: routes
+                                .first()
+                                .and_then(|r| r.rtt())
+                                .map(|ms| Duration::from_millis(ms as u64)),
+                        },
+                        rustp2p_quic::LinkMode::Relay => PathState::Relay {
+                            relay: routes
+                                .first()
+                                .map(|r| r.route_key().peer_addr().to_string())
+                                .unwrap_or_else(|| "中继".to_string()),
+                            rtt: routes
+                                .first()
+                                .and_then(|r| r.rtt())
+                                .map(|ms| Duration::from_millis(ms as u64)),
+                        },
+                    };
+                    let changed = last.as_ref() != Some(&(peer.clone(), current.clone()));
+                    if changed {
+                        last = Some((peer.clone(), current.clone()));
+                        if peers.first() == Some(peer) {
+                            *state.lock().unwrap() = current.clone();
+                        }
+                        let _ = events.send(crate::transport::to_event(&current));
+                    }
+                }
+            }
+        });
+    }
+}
+
+use std::time::Duration;
+
+#[async_trait::async_trait]
+impl TransportEndpoint for Rustp2pTransport {
+    fn kind(&self) -> TransportKind {
+        TransportKind::Rustp2p
+    }
+
+    fn local_id(&self) -> String {
+        self.endpoint.peer_id().as_str().to_string()
+    }
+
+    async fn open_stream(&self, peer: &PeerRef) -> Result<Box<dyn AsyncStream>> {
+        let PeerRef::Rustp2p(id) = peer else {
+            anyhow::bail!("rustp2p 后端只能连接 rustp2p 类型的对端标识");
+        };
+        let peer_id = PeerId::new(id.clone());
+        let (send, recv) = self
+            .endpoint
+            .open_bi(peer_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("打开到 {id} 的双向流失败: {e}"))?;
+        Ok(Box::new(Rustp2pStream::new(send, recv)))
+    }
+
+    async fn accept_stream(&self) -> Result<AcceptedStream> {
+        let mut rx = self.incoming.lock().await;
+        match rx.recv().await {
+            Some(Ok(s)) => Ok(s),
+            Some(Err(e)) => Err(e),
+            None => anyhow::bail!("rustp2p 端点已关闭"),
+        }
+    }
+
+    fn path_state(&self) -> PathState {
+        self.state.lock().unwrap().clone()
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<TransportEvent> {
+        self.events.subscribe()
+    }
+
+    async fn close(&self) {
+        self.endpoint.close().await;
+    }
+}
+
+/// 等待中的写命令发送 future。
+///
+/// `mpsc::Sender::send` 返回的 future 借用 sender，所以用 `async move` 包一层，
+/// 让它 own 住 sender —— 这样 future 才是 `'static`，能存进结构体。
+type PendingWrite = Pin<Box<dyn Future<Output = Result<(), mpsc::error::SendError<WriteCmd>>> + Send>>;
+
+/// 等待中的写半边关闭 future。
+type PendingFinish = Pin<Box<dyn Future<Output = io::Result<()>> + Send>>;
+
+/// 写侧命令。
+enum WriteCmd {
+    /// 追加数据（后台任务按序写出）。
+    Data(Vec<u8>),
+    /// 结束写半边。
+    Finish(oneshot::Sender<io::Result<()>>),
+}
+
+/// rustp2p 可靠流 ↔ Tokio 字节流的适配器。
+pub struct Rustp2pStream {
+    /// 写命令发送端。
+    write_tx: mpsc::Sender<WriteCmd>,
+    /// 等待中的写命令发送 future（用于背压）。
+    write_pending: Option<PendingWrite>,
+    /// 等待中的写半边关闭 future。
+    finish_pending: Option<PendingFinish>,
+    /// 读数据接收端。
+    read_rx: mpsc::Receiver<io::Result<Vec<u8>>>,
+    /// 已收到但还没被上层取走的读数据。
+    read_buf: Vec<u8>,
+    /// 读缓冲的已消费位置。
+    read_pos: usize,
+    /// 读侧是否已结束（对端 EOF 或出错）。
+    read_done: bool,
+}
+
+impl Rustp2pStream {
+    /// 组装一条流：把读写两半交给后台任务。
+    pub fn new(
+        send: rustp2p_quic::ReliableSendStream,
+        recv: rustp2p_quic::ReliableRecvStream,
+    ) -> Self {
+        let (write_tx, mut write_rx) = mpsc::channel::<WriteCmd>(WRITE_CHANNEL_CAPACITY);
+        let (read_tx, read_rx) = mpsc::channel::<io::Result<Vec<u8>>>(READ_CHANNEL_CAPACITY);
+
+        // 写任务：按序把数据交给 QUIC。
+        tokio::spawn(async move {
+            let mut send = send;
+            while let Some(cmd) = write_rx.recv().await {
+                match cmd {
+                    WriteCmd::Data(data) => {
+                        if let Err(e) = send.write_all(&data).await {
+                            tracing::warn!("rustp2p 写入失败: {e}");
+                            break;
+                        }
+                    }
+                    WriteCmd::Finish(tx) => {
+                        let r = send.finish();
+                        let _ = tx.send(r);
+                        break;
+                    }
+                }
+            }
+        });
+
+        // 读任务：循环读，把每个 chunk 送出去。
+        tokio::spawn(async move {
+            let mut recv = recv;
+            let mut buf = vec![0u8; READ_CHUNK];
+            loop {
+                match recv.read(&mut buf).await {
+                    Ok(Some(n)) => {
+                        if read_tx.send(Ok(buf[..n].to_vec())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        let _ = read_tx.send(Err(e)).await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        Self {
+            write_tx,
+            write_pending: None,
+            finish_pending: None,
+            read_rx,
+            read_buf: Vec::new(),
+            read_pos: 0,
+            read_done: false,
+        }
+    }
+}
+
+impl AsyncRead for Rustp2pStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            if this.read_pos < this.read_buf.len() {
+                let avail = this.read_buf.len() - this.read_pos;
+                let n = avail.min(buf.remaining());
+                buf.put_slice(&this.read_buf[this.read_pos..this.read_pos + n]);
+                this.read_pos += n;
+                if this.read_pos >= this.read_buf.len() {
+                    this.read_buf.clear();
+                    this.read_pos = 0;
+                }
+                return Poll::Ready(Ok(()));
+            }
+            if this.read_done {
+                // EOF：不再往 buf 里放字节。
+                return Poll::Ready(Ok(()));
+            }
+            match this.read_rx.poll_recv(cx) {
+                Poll::Ready(Some(Ok(data))) => {
+                    this.read_buf = data;
+                    this.read_pos = 0;
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    this.read_done = true;
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Ready(None) => {
+                    this.read_done = true;
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl AsyncWrite for Rustp2pStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        // 上一次发送还没完成 —— 先等它。
+        if let Some(fut) = this.write_pending.as_mut() {
+            match fut.as_mut().poll(cx) {
+                Poll::Ready(Ok(())) => this.write_pending = None,
+                Poll::Ready(Err(_)) => {
+                    this.write_pending = None;
+                    return Poll::Ready(Err(broken_pipe()));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        // 发送新数据。channel 满了就返回 Pending —— 背压。
+        // 必须先克隆 sender：否则 future 借用 `this`，存不进 'static 的槽位。
+        let tx = this.write_tx.clone();
+        let data = buf.to_vec();
+        // 用 async move 包一层：`Sender::send` 返回的 future 借用 sender，
+        // 而槽位要求 'static —— async block 把 sender 收进自己的状态里。
+        let mut fut = Box::pin(async move { tx.send(WriteCmd::Data(data)).await });
+        match fut.as_mut().poll(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(broken_pipe())),
+            Poll::Pending => {
+                this.write_pending = Some(fut);
+                Poll::Pending
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // quinn 没有用户态 flush：`write_all` 已经把数据交给 QUIC 发送缓冲。
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if let Some(fut) = this.finish_pending.as_mut() {
+            return fut.as_mut().poll(cx);
+        }
+        let (tx, rx) = oneshot::channel();
+        let cmd = WriteCmd::Finish(tx);
+        let sender = this.write_tx.clone();
+        let fut = Box::pin(async move {
+            if sender.send(cmd).await.is_err() {
+                return Err(broken_pipe());
+            }
+            // 后台任务回复 finish 的结果；拿不到就当作成功（流已经关了）。
+            match rx.await {
+                Ok(r) => r,
+                Err(_) => Ok(()),
+            }
+        });
+        this.finish_pending = Some(fut);
+        this.finish_pending.as_mut().unwrap().as_mut().poll(cx)
+    }
+}
+
+/// 连接已断。
+fn broken_pipe() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "rustp2p 流已关闭")
+}
