@@ -209,8 +209,10 @@ fn warn_relay_mismatch(endpoint: &Endpoint, tag: &str, info: &PathInfo) {
             info.remote,
             home.as_deref().unwrap_or("?")
         );
+        // 给出的必须是**对端正在用的那个** relay —— 直接抄进命令行就能对齐。
         println!(
-            " [路径·{tag}]   ↳ 两端用**同一个** relay 可省掉这一跳：--relay https://aps1-1.relay.n0.iroh.link./"
+            " [路径·{tag}]   ↳ 在本端加上这个参数即可对齐（对端正在用它）：--relay {}",
+            info.remote
         );
     }
 }

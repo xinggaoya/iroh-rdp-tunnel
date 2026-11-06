@@ -166,7 +166,7 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         }
     }
 
-    print_banner_network(&rt.endpoint);
+    print_banner_network(&rt.endpoint, endpoint_id);
 
     println!();
     println!(" 等待客户端连接…  (Ctrl-C 退出)");
@@ -222,14 +222,14 @@ fn print_banner_head(cfg: &ServerConfig, endpoint_id: EndpointId) {
 }
 
 /// 打印网络信息部分（等 relay 连上之后）。
-fn print_banner_network(endpoint: &Endpoint) {
+fn print_banner_network(endpoint: &Endpoint, endpoint_id: EndpointId) {
     let addr = endpoint.addr();
 
     let relays: Vec<_> = addr.relay_urls().collect();
     if relays.is_empty() {
         println!(" 中继          : ⚠ 未连上任何 relay（客户端将无法建连）");
     } else {
-        for u in relays {
+        for u in &relays {
             println!(" 中继          : {u}");
         }
     }
@@ -253,6 +253,17 @@ fn print_banner_network(endpoint: &Endpoint) {
     }
     for ip in &private {
         println!(" 本机地址      : {ip}   (私网)");
+    }
+
+    // 把客户端要跑的**完整命令**打出来。
+    //
+    // 两端各自自动选 relay 极易选到不同家（实测：服务端 euc1-1 欧洲、
+    // 客户端 usw1-1 美西），流量就得多走一跳中继转发，RTT 从 ~400ms 涨到 1200ms。
+    // 让用户直接复制这一行，就不可能漏掉 --relay。
+    if let Some(relay) = relays.first() {
+        println!();
+        println!(" 客户端请执行（**必须带同样的 relay**，否则会多一跳中继转发）:");
+        println!("   irt client {endpoint_id} --relay {relay}");
     }
 }
 
