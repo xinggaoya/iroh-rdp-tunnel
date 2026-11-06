@@ -7,11 +7,14 @@ pub mod addrpolicy;
 pub mod cli;
 pub mod commands;
 pub mod config;
+pub mod diag;
 pub mod connmgr;
 pub mod endpoint;
 pub mod fw;
 pub mod keys;
+pub mod nat;
 pub mod pathinfo;
+pub mod portmap;
 pub mod tunnel;
 
 /// QUIC 握手中协商的 ALPN；两端必须完全一致。
