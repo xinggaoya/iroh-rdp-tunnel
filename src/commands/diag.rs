@@ -10,9 +10,10 @@ use iroh::{RelayMode, Watcher as _};
 
 use crate::{
     addrpolicy::PublishPolicy,
-    cli::DiagArgs,
+    cli::{DiagArgs, parse_endpoint_id},
     diag::{DiagReport, render, render_json},
     endpoint::{Discovery, EndpointOptions, bind},
+    lookup,
     nat::{profile_from_report, verdict},
     portmap::{self, PortMappingStatus},
 };
@@ -31,6 +32,11 @@ const PORTMAP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 运行网络体检。
 pub async fn run(args: DiagArgs) -> Result<()> {
+    // `--lookup` 是另一种模式：查**对端**公布了什么，而不是体检本机网络。
+    if let Some(raw) = args.lookup.as_deref() {
+        return run_lookup(raw, args.json).await;
+    }
+
     // 端口映射探测与 net report 互不依赖，并行跑。
     let pm_task = tokio::spawn(portmap::probe());
 
@@ -95,5 +101,17 @@ pub async fn run(args: DiagArgs) -> Result<()> {
 
     // 优雅关闭，否则 iroh 会报 "Endpoint dropped without calling close()"。
     endpoint.close().await;
+    Ok(())
+}
+
+/// 查询对端在 n0 上公布的地址，并判定客户端能否连上。
+async fn run_lookup(raw_id: &str, json: bool) -> Result<()> {
+    let id = parse_endpoint_id(raw_id)?;
+    let report = lookup::lookup(id).await?;
+    if json {
+        println!("{}", lookup::render_json(&report));
+    } else {
+        print!("{}", lookup::render(&report));
+    }
     Ok(())
 }

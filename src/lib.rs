@@ -12,6 +12,7 @@ pub mod connmgr;
 pub mod endpoint;
 pub mod fw;
 pub mod keys;
+pub mod lookup;
 pub mod nat;
 pub mod pathinfo;
 pub mod portmap;

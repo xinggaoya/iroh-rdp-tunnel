@@ -132,6 +132,13 @@ pub struct DiagArgs {
     /// 以 JSON 输出，便于脚本处理。
     #[arg(long)]
     pub json: bool,
+
+    /// 改为查询**对端**在 n0 上公布的地址（而不是体检本机网络）。
+    ///
+    /// 查到的就是客户端实际会拿到的东西：只有 IP 没有 relay 时，
+    /// 客户端会被困在直连上，NAT 过滤会让它必然超时。
+    #[arg(long, value_name = "ENDPOINT_ID")]
+    pub lookup: Option<String>,
 }
 
 /// 解析 `irt server` 的配置。

@@ -159,6 +159,44 @@ server 公布 relay URL（iroh 标准模型）
 > 而在**地址依赖过滤**的 NAT 后面这必然失败 —— 也就没有通道去交换打洞候选，
 > 直连永远不可能发生。v0.2 把默认值改了回来。
 
+### 一个更隐蔽的坑：两个 publisher 抢同一个 key
+
+旧版用的是 `Endpoint::builder(presets::N0)`，然后又追加了
+`.address_lookup(PkarrPublisher::n0_dns().addr_filter(ip_only()))`。
+
+问题在于 iroh 的两个默认值：
+
+| 事实 | 源码位置 | 后果 |
+|---|---|---|
+| `Builder::address_lookup()` 是**追加**不是替换 | `endpoint.rs:605` `self.address_lookup.push(...)` | 端点上挂了**两个** publisher |
+| `PkarrPublisherBuilder::new()` 的默认过滤器是 `AddrFilter::relay_only()` | `address_lookup/pkarr.rs:168` | publisher #1 只发 relay URL |
+
+两个 publisher 写**同一个 endpoint id 的同一条 pkarr 记录**，后写覆盖先写：
+
+- publisher #1（`presets::N0` 自带）→ 记录里只有 `relay=...`
+- publisher #2（追加的 `ip_only`）→ 记录里只有 `ip=...`
+
+pkarr 的重发布间隔是 **5 分钟**（`DEFAULT_REPUBLISH_INTERVAL`），TTL 30 秒。
+也就是说这条记录会**在两种形态之间来回翻**，客户端解析到哪种全看运气 ——
+拿到只有 IP 的那次，就必然超时。
+
+v0.2 的做法：**不用 `presets::N0`**，改用 `presets::Minimal` +
+**唯一一个** `PkarrPublisher`，过滤策略由 `--publish` 决定：
+
+```rust
+builder = builder
+    .address_lookup(PkarrPublisher::n0_dns().addr_filter(opts.publish.to_addr_filter()))
+    .address_lookup(DnsAddressLookup::n0_dns());   // 只解析、不发布
+```
+
+实测（`dns.iroh.link` 上的真实记录）：
+
+```
+_iroh.<z32>.dns.iroh.link  TXT  "relay=https://use1-1.relay.n0.iroh.link./"
+```
+
+一条记录、一种形态、始终带 relay URL。客户端用 `irt diag --lookup <id>` 可随时复查。
+
 ### 直连优先，但中继永远兜底
 
 iroh 默认的路径选择器把 IPv4/IPv6 放在 primary 层、relay 放在 backup 层，
@@ -233,13 +271,47 @@ iroh 的 net report **只能测映射行为，测不了过滤行为**。`irt dia
 
 要严格验证过滤行为，可以用 `netdiag/filter-proof.js` 那套脚本（需要外部 STUN 资源）。
 
+### `irt diag --lookup`：查对端公布了什么
+
+```powershell
+.\irt.exe diag --lookup 1a4172f599783632000f88cac5f11ec0b5bc164c0aa43e1e94ceb4f8e436366c
+```
+
+```
+=========================================================
+ iroh-rdp-tunnel 对端公布地址查询
+=========================================================
+ endpoint id   : 1a4172f599783632000f88cac5f11ec0b5bc164c0aa43e1e94ceb4f8e436366c
+ 公布的中继     :
+                 https://euc1-1.relay.n0.iroh.link./
+ 公布的 IP     : （无）
+
+ 判定: ✅ 客户端能连上
+   · 记录里含 relay URL：客户端可以经中继建连，必然可用
+   · 只公布了 relay URL（relay-only 策略）：直连需要双方同时发包打洞，成功前流量走中继
+ 建议:
+   1. 中继延迟高？用 --relay 指定更近的中继
+=========================================================
+```
+
+查的是**与 iroh 客户端完全相同**的解析路径（`_iroh.<z32>.dns.iroh.link` 的 TXT 记录），
+所以看到的就是客户端会拿到的东西。判定规则：
+
+| 对端公布的记录 | 客户端能走的路 | 后果 |
+|---|---|---|
+| 含 relay URL | 中继路径（+ 可能打洞） | ✅ 一定能连上 |
+| 只有 IP | 只能直连 | ⚠ NAT 过滤（家宽光猫常见）会丢首包 → 必然超时 |
+| 什么都没有 | 无 | ❌ 连不上 |
+
+**这是「client 连不上」时最该先跑的一条命令** —— 它能一步区分「网络不通」和「对端没公布中继地址」。
+
 ---
 
 ## 排障决策树
 
 | 现象 | 排查顺序 |
 |---|---|
-| **client 连不上**（一直转圈） | 1. `irt server` 是不是还开着、id 抄对了吗<br>2. 被控端能上外网吗（`irt diag` 看公网端点）<br>3. 防火墙：被控端跑过 `irt server --install-firewall-rule` 吗 |
+| **client 连不上**（一直转圈） | 1. `irt server` 是不是还开着、id 抄对了吗<br>2. 被控端能上外网吗（`irt diag` 看公网端点）<br>3. 防火墙：被控端跑过 `irt server --install-firewall-rule` 吗<br>4. `irt diag --lookup <id>` —— 看**对端到底公布了什么**（只有 IP 没有 relay 就会必然超时） |
 | **一直显示「中继」，没有「✅ 已切换到直连」** | 1. 防火墙规则装了吗（**最常见原因**）<br>2. 跑 `irt diag` 看映射行为是不是 EIM<br>3. 中继延迟高（>150ms）？换一个更近的 relay：`irt server --relay https://aps1-1.relay.n0.iroh.link./`<br>4. 对端也在 NAT 后面？**双方都要能打洞** |
 | **首帧很慢，之后正常** | 打洞本身要几次往返，第一次连接会慢一些。第二次连接因为连接已建立会很快 |
 | **mstsc 报「无法连接到 127.0.0.1:13389」** | client 没运行；或端口被占用；或本机防火墙拦了本地回环 |
@@ -263,6 +335,7 @@ irt client <ENDPOINT_ID> [--listen ADDR] [--relay URL]... [--no-relay]
                   [--install-firewall-rule] [--uninstall-firewall-rule]
 
 irt diag [--json]
+irt diag --lookup <ENDPOINT_ID> [--json]
 ```
 
 | 参数 | 说明 |
@@ -278,6 +351,7 @@ irt diag [--json]
 | `--ca-file` | 额外的根证书文件（PEM），用于信任自签证书的自建 relay |
 | `--install-firewall-rule` | 添加入站 UDP 防火墙规则后退出（**需管理员**）。server 与 client 是同一个 exe，一条规则两边都覆盖 |
 | `--uninstall-firewall-rule` | 删除该规则后退出（需管理员） |
+| `--lookup` | `irt diag` 的一个模式：查**对端**在 n0 上公布的地址，而不是体检本机网络 |
 
 ### 环境变量
 
