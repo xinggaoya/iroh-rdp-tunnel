@@ -6,6 +6,7 @@
 //! 与远端保持**一条**常驻 QUIC 连接（见 [`crate::connmgr`]），
 //! 每条本地 TCP 连接只开一条 QUIC 双向流 —— 打洞只发生一次。
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -16,15 +17,14 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::{
     BUILD_TAG,
     config::ClientConfig,
-    connmgr::ConnManager,
     endpoint::{EndpointOptions, bind_resolver_only},
     keys::{load_or_create_secret_key, write_endpoint_id_hint},
-    tunnel::bridge_tcp_to_quic,
+    transport::{PeerRef, TransportEndpoint, iroh::IrohTransport},
+    tunnel::bridge_tcp_to_stream,
 };
 
 /// 等待远端连接就绪的超时。
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-
+///
 /// 等待本机 net report 就绪的超时。
 ///
 /// **这个等待很关键**：打洞时客户端要用 `REACH_OUT` 帧通告自己的公网候选，
@@ -71,7 +71,8 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
     }
 
     // 后台立即开始建连（打洞也随之开始），不等到用户打开 mstsc。
-    let mgr = ConnManager::start(endpoint.clone(), cfg.remote);
+    let transport = IrohTransport::new_client(endpoint.clone(), cfg.remote, None);
+    let peer = PeerRef::Iroh(cfg.remote);
 
     let listener = TcpListener::bind(cfg.listen)
         .await
@@ -128,10 +129,11 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
     // Ctrl-C 时优雅关闭端点（否则 iroh 会报
     // "Endpoint dropped without calling close()"）。
     tokio::select! {
-        r = serve_local(mgr, listener) => r,
+        r = serve_local(transport.clone(), peer, listener) => r,
         r = tokio::signal::ctrl_c() => {
             r?;
             println!("\n正在关闭…");
+            transport.close().await;
             endpoint.close().await;
             Ok(())
         }
@@ -142,20 +144,25 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
 ///
 /// 抽出来是为了让集成测试能驱动**与生产完全相同**的这条路径
 /// （本地 TCP → 常驻 QUIC 连接 → 远端）。
-pub async fn serve_local(mgr: ConnManager, listener: TcpListener) -> Result<()> {
+pub async fn serve_local(
+    transport: Arc<dyn TransportEndpoint>,
+    remote: PeerRef,
+    listener: TcpListener,
+) -> Result<()> {
     loop {
-        let (tcp, peer) = match listener.accept().await {
+        let (tcp, tcp_peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("本地 TCP accept 失败: {e}");
                 continue;
             }
         };
-        tracing::info!("本地 RDP 客户端接入: {peer}");
+        tracing::info!("本地 RDP 客户端接入: {tcp_peer}");
 
-        let mgr = mgr.clone();
+        let transport = transport.clone();
+        let remote = remote.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_session(mgr, tcp).await {
+            if let Err(e) = handle_session(transport, remote, tcp).await {
                 tracing::warn!("会话结束: {e:#}");
             }
         });
@@ -163,21 +170,16 @@ pub async fn serve_local(mgr: ConnManager, listener: TcpListener) -> Result<()> 
 }
 
 /// 把一条本地 TCP 连接桥接到远端。
-pub async fn handle_session(mgr: ConnManager, local: TcpStream) -> Result<()> {
-    let conn = mgr.connection(CONNECT_TIMEOUT).await?;
-    // 连接可能刚好在这一瞬间断开，open_bi 会失败 —— 换一条新连接重试一次。
-    let (send, recv) = match conn.open_bi().await {
-        Ok(s) => s,
-        Err(first) => {
-            tracing::warn!("打开 QUIC 双向流失败（连接可能刚断开）: {first}，重试一次");
-            let conn = mgr.connection(CONNECT_TIMEOUT).await?;
-            conn.open_bi()
-                .await
-                .context("重试后仍无法打开 QUIC 双向流")?
-        }
-    };
-    bridge_tcp_to_quic(local, send, recv)
+pub async fn handle_session(
+    transport: Arc<dyn TransportEndpoint>,
+    peer: PeerRef,
+    local: TcpStream,
+) -> Result<()> {
+    // 打开到远端的流（连接刚断时后端会自己重试一次）。
+    let stream = transport
+        .open_stream(&peer)
         .await
-        .context("桥接失败")?;
+        .context("打开到远端的流失败")?;
+    bridge_tcp_to_stream(local, stream).await.context("桥接失败")?;
     Ok(())
 }

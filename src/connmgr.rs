@@ -76,6 +76,17 @@ impl ConnManager {
         self.remote
     }
 
+    /// 当前连接（若有），**不等待**。
+    ///
+    /// 已经关闭的连接会被跳过 —— 拿到一条死连接比拿不到更糟。
+    /// 供路径状态轮询使用（不能为了看一眼路径状态就阻塞等待）。
+    pub fn current(&self) -> Option<iroh::endpoint::Connection> {
+        self.conn_rx
+            .borrow()
+            .clone()
+            .filter(|c| c.close_reason().is_none())
+    }
+
     /// 取当前可用连接；尚无连接则等待，最多等 `timeout`。
     ///
     /// 会跳过**已经关闭**的连接：连接刚断时，后台任务还没来得及把 watch 里的

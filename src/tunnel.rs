@@ -105,22 +105,23 @@ where
     }
 }
 
-/// server 侧：QUIC 流 ↔ 本地 TCP。
-pub async fn bridge_quic_to_tcp(
-    send: SendStream,
-    recv: RecvStream,
+/// server 侧：传输层流 ↔ 本地 TCP。
+///
+/// 用传输层的 [`crate::transport::AsyncStream`] 而不是 iroh 的 QUIC 流，
+/// 这样 server 代码与具体后端解耦。
+pub async fn bridge_stream_to_tcp(
+    stream: Box<dyn crate::transport::AsyncStream>,
     tcp: tokio::net::TcpStream,
 ) -> io::Result<()> {
-    bridge(QuicStream::new(send, recv), tcp).await
+    bridge(stream, tcp).await
 }
 
-/// client 侧：本地 TCP ↔ QUIC 流。
-pub async fn bridge_tcp_to_quic(
+/// client 侧：本地 TCP ↔ 传输层流。
+pub async fn bridge_tcp_to_stream(
     local: tokio::net::TcpStream,
-    send: SendStream,
-    recv: RecvStream,
+    stream: Box<dyn crate::transport::AsyncStream>,
 ) -> io::Result<()> {
-    bridge(local, QuicStream::new(send, recv)).await
+    bridge(local, stream).await
 }
 
 #[cfg(test)]
