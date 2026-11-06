@@ -3,7 +3,7 @@
 //! 配置优先级：**CLI 参数 > 环境变量 > 默认值**。
 //! 环境变量通过注入式的 [`EnvSource`] 读取，单元测试不碰进程环境。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clap::{Args as ClapArgs, Parser, Subcommand};
@@ -12,8 +12,12 @@ use iroh::{EndpointId, RelayMode, RelayUrl};
 use crate::{
     addrpolicy::PublishPolicy,
     commands,
-    config::{ClientConfig, EnvSource, ServerConfig},
+    config::{
+        ClientConfig, EnvSource, Rustp2pSettings, ServerConfig, DEFAULT_ASSISTANT_SOCKETS,
+        DEFAULT_STUN_SERVERS,
+    },
     endpoint::Discovery,
+    transport::TransportKind,
 };
 
 /// 顶层命令。
@@ -63,9 +67,16 @@ pub struct ServerArgs {
     #[arg(long)]
     pub no_relay: bool,
 
-    /// 允许接入的 endpoint id 白名单，可重复指定。
+    /// 允许接入的 endpoint id 白名单，可重复指定（iroh 模式）。
     #[arg(long = "allow", value_name = "ID")]
     pub allow: Vec<String>,
+
+    /// 允许接入的 peer id 白名单，可重复指定（rustp2p 模式）。
+    ///
+    /// **只是字符串比对，不是身份认证** —— rustp2p 的 peer id 是任意字符串，
+    /// 证书校验又被降级为跳过。
+    #[arg(long = "allow-peer", value_name = "ID")]
+    pub allow_peer: Vec<String>,
 
     /// 不使用 n0 公共 pkarr / DNS（自建 relay、离线环境）。
     #[arg(long)]
@@ -82,14 +93,48 @@ pub struct ServerArgs {
     /// 删除本程序的入站 UDP 防火墙放行规则后退出（需管理员权限）。
     #[arg(long)]
     pub uninstall_firewall_rule: bool,
+
+    /// 传输后端：iroh | rustp2p（默认 iroh）。
+    ///
+    /// rustp2p 走自建中继与端口预测打洞，能对付**对称 NAT**；
+    /// iroh 的打洞候选只来自中继观测，对称 NAT 下打不通。
+    #[arg(long, value_name = "KIND")]
+    pub transport: Option<String>,
+
+    /// rustp2p 的本机 peer id（默认随机生成并持久化）。
+    #[arg(long, value_name = "ID")]
+    pub node_id: Option<String>,
+
+    /// rustp2p 身份文件路径（存 peer id 与证书种子）。
+    #[arg(long, value_name = "PATH")]
+    pub identity_file: Option<PathBuf>,
+
+    /// rustp2p 的本地监听地址（默认 0.0.0.0:0，由系统分配端口）。
+    #[arg(long, value_name = "ADDR")]
+    pub bind: Option<String>,
+
+    /// rustp2p 的 bootstrap 节点（公网 VPS 上的 node，兼作中继），可重复指定。
+    #[arg(long, value_name = "ADDR")]
+    pub bootstrap: Vec<String>,
+
+    /// STUN 服务器，可重复指定（默认三个国内公共 STUN）。
+    #[arg(long, value_name = "ADDR")]
+    pub stun: Vec<String>,
+
+    /// 对称 NAT 打洞的辅助 socket 数（默认 4）。
+    #[arg(long, value_name = "N")]
+    pub assistant_sockets: Option<usize>,
 }
 
 /// `irt client` 的参数。
 #[derive(ClapArgs, Debug, Clone, Default)]
 pub struct ClientArgs {
     /// 远端 endpoint id（由 `irt server` 打印）。
+    ///
+    /// rustp2p 模式下这个位置参数也可以直接写对端的 peer id；
+    /// iroh 模式下必须提供。
     #[arg(value_name = "ENDPOINT_ID")]
-    pub remote: String,
+    pub remote: Option<String>,
 
     /// 本地「假 RDP」监听地址（默认 127.0.0.1:13389）。
     #[arg(long, value_name = "ADDR")]
@@ -124,6 +169,41 @@ pub struct ClientArgs {
     /// 删除本程序的入站 UDP 防火墙放行规则后退出（需管理员权限）。
     #[arg(long)]
     pub uninstall_firewall_rule: bool,
+
+    /// 传输后端：iroh | rustp2p（默认 iroh）。
+    #[arg(long, value_name = "KIND")]
+    pub transport: Option<String>,
+
+    /// rustp2p 的对端 peer id。
+    ///
+    /// iroh 模式用位置参数（endpoint id）；rustp2p 模式用这个 ——
+    /// 也允许直接用位置参数，两种写法等价。
+    #[arg(long, value_name = "ID")]
+    pub peer: Option<String>,
+
+    /// rustp2p 的本机 peer id（默认随机生成并持久化）。
+    #[arg(long, value_name = "ID")]
+    pub node_id: Option<String>,
+
+    /// rustp2p 身份文件路径（存 peer id 与证书种子）。
+    #[arg(long, value_name = "PATH")]
+    pub identity_file: Option<PathBuf>,
+
+    /// rustp2p 的本地监听地址（默认 0.0.0.0:0，由系统分配端口）。
+    #[arg(long, value_name = "ADDR")]
+    pub bind: Option<String>,
+
+    /// rustp2p 的 bootstrap 节点（公网 VPS 上的 node，兼作中继），可重复指定。
+    #[arg(long, value_name = "ADDR")]
+    pub bootstrap: Vec<String>,
+
+    /// STUN 服务器，可重复指定（默认三个国内公共 STUN）。
+    #[arg(long, value_name = "ADDR")]
+    pub stun: Vec<String>,
+
+    /// 对称 NAT 打洞的辅助 socket 数（默认 4）。
+    #[arg(long, value_name = "N")]
+    pub assistant_sockets: Option<usize>,
 }
 
 /// `irt diag` 的参数。
@@ -159,9 +239,20 @@ pub fn resolve_server(args: &ServerArgs, env: &EnvSource) -> anyhow::Result<Serv
         .with_context(|| format!("无法解析 RDP 地址 `{rdp_target}`"))?;
 
     let relay_mode = resolve_relay_mode(args.no_relay, &args.relay, env)?;
-    let allow_list = resolve_allow_list(args, env)?;
     let discovery = resolve_discovery(args.no_discovery, env);
     let ca_tls_config = resolve_ca(args.ca_file.as_deref(), env)?;
+    let transport = resolve_transport(args.transport.as_deref(), env)?;
+    let (allow_list, allow_peers) = resolve_allow_list(args, env, transport)?;
+    let rustp2p = resolve_rustp2p(
+        args.node_id.as_deref(),
+        args.identity_file.as_deref(),
+        args.bind.as_deref(),
+        &args.bootstrap,
+        &args.stun,
+        args.assistant_sockets,
+        env,
+        false,
+    )?;
 
     Ok(ServerConfig {
         key_file,
@@ -169,14 +260,31 @@ pub fn resolve_server(args: &ServerArgs, env: &EnvSource) -> anyhow::Result<Serv
         publish,
         relay_mode,
         allow_list,
+        allow_peers,
         discovery,
         ca_tls_config,
+        transport,
+        rustp2p,
     })
 }
 
 /// 解析 `irt client` 的配置。
 pub fn resolve_client(args: &ClientArgs, env: &EnvSource) -> anyhow::Result<ClientConfig> {
-    let remote = parse_endpoint_id(&args.remote)?;
+    let transport = resolve_transport(args.transport.as_deref(), env)?;
+
+    // iroh 模式必须有远端 endpoint id；rustp2p 模式用 peer id。
+    let raw_remote = args.remote.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let remote = match transport {
+        TransportKind::Iroh => {
+            let raw = raw_remote.with_context(|| {
+                "缺少远端 endpoint id —— 用法: irt client <ENDPOINT_ID>（由 irt server 打印）"
+            })?;
+            Some(parse_endpoint_id(raw)?)
+        }
+        TransportKind::Rustp2p => None,
+    };
+    let peer = resolve_peer(args.peer.as_deref(), raw_remote, transport, env)?;
+
     let listen = match (&args.listen, env.get("IRT_LISTEN")) {
         (Some(v), _) => v.clone(),
         (None, Some(v)) => v.to_string(),
@@ -193,6 +301,16 @@ pub fn resolve_client(args: &ClientArgs, env: &EnvSource) -> anyhow::Result<Clie
         (None, Some(v)) => PathBuf::from(v),
         (None, None) => crate::config::default_client_key_file(),
     };
+    let rustp2p = resolve_rustp2p(
+        args.node_id.as_deref(),
+        args.identity_file.as_deref(),
+        args.bind.as_deref(),
+        &args.bootstrap,
+        &args.stun,
+        args.assistant_sockets,
+        env,
+        true,
+    )?;
     Ok(ClientConfig {
         remote,
         listen,
@@ -200,6 +318,125 @@ pub fn resolve_client(args: &ClientArgs, env: &EnvSource) -> anyhow::Result<Clie
         discovery,
         ca_tls_config,
         key_file,
+        transport,
+        rustp2p,
+        peer,
+    })
+}
+
+/// 传输后端：CLI `--transport` > 环境变量 `IRT_TRANSPORT` > 默认 `iroh`。
+fn resolve_transport(raw: Option<&str>, env: &EnvSource) -> anyhow::Result<TransportKind> {
+    if let Some(v) = raw {
+        return TransportKind::parse(v);
+    }
+    if let Some(v) = env.get("IRT_TRANSPORT") {
+        return TransportKind::parse(v);
+    }
+    Ok(TransportKind::Iroh)
+}
+
+/// rustp2p 的对端 peer id。
+///
+/// 优先级：`--peer` > `IRT_PEER` > 位置参数（仅 rustp2p 模式）。
+fn resolve_peer(
+    cli_peer: Option<&str>,
+    positional: Option<&str>,
+    transport: TransportKind,
+    env: &EnvSource,
+) -> anyhow::Result<Option<String>> {
+    if let Some(v) = cli_peer {
+        let v = v.trim();
+        if !v.is_empty() {
+            return Ok(Some(v.to_string()));
+        }
+    }
+    if let Some(v) = env.get("IRT_PEER") {
+        return Ok(Some(v.trim().to_string()));
+    }
+    match transport {
+        TransportKind::Rustp2p => match positional {
+            Some(v) => Ok(Some(v.to_string())),
+            None => anyhow::bail!(
+                "缺少对端 peer id —— 用法: irt client --transport rustp2p --peer <PEER_ID>，\
+                 也可直接写位置参数: irt client <PEER_ID>"
+            ),
+        },
+        TransportKind::Iroh => Ok(None),
+    }
+}
+
+/// rustp2p 后端的配置。
+#[allow(clippy::too_many_arguments)]
+fn resolve_rustp2p(
+    node_id: Option<&str>,
+    identity_file: Option<&Path>,
+    bind: Option<&str>,
+    bootstrap: &[String],
+    stun: &[String],
+    assistant_sockets: Option<usize>,
+    env: &EnvSource,
+    is_client: bool,
+) -> anyhow::Result<Rustp2pSettings> {
+    let identity_file = match (identity_file, env.get("IRT_IDENTITY_FILE")) {
+        (Some(p), _) => p.to_path_buf(),
+        (None, Some(v)) => PathBuf::from(v),
+        (None, None) => {
+            if is_client {
+                crate::config::default_client_rustp2p_identity_file()
+            } else {
+                crate::config::default_rustp2p_identity_file()
+            }
+        }
+    };
+
+    let bind_raw = match (bind, env.get("IRT_BIND")) {
+        (Some(v), _) => v.to_string(),
+        (None, Some(v)) => v.to_string(),
+        (None, None) => "0.0.0.0:0".to_string(),
+    };
+    let bind = bind_raw
+        .parse()
+        .with_context(|| format!("无法解析 rustp2p 监听地址 `{bind_raw}`"))?;
+
+    // bootstrap：CLI 优先，CLI 为空时用环境变量。
+    let mut bootstrap_list: Vec<String> = bootstrap.to_vec();
+    if bootstrap_list.is_empty() {
+        bootstrap_list = env.get_list("IRT_BOOTSTRAP");
+    }
+    let mut bootstrap_addrs = Vec::with_capacity(bootstrap_list.len());
+    for s in &bootstrap_list {
+        let addr = s
+            .trim()
+            .parse()
+            .with_context(|| format!("无法解析 bootstrap 地址 `{s}`（应为 host:port）"))?;
+        bootstrap_addrs.push(addr);
+    }
+
+    // STUN：CLI 优先，CLI 为空时用环境变量，再空则用内置默认值。
+    let mut stun_list: Vec<String> = stun.to_vec();
+    if stun_list.is_empty() {
+        stun_list = env.get_list("IRT_STUN");
+    }
+    if stun_list.is_empty() {
+        stun_list = DEFAULT_STUN_SERVERS.iter().map(|s| s.to_string()).collect();
+    }
+
+    let max_assistant_sockets = match (assistant_sockets, env.get("IRT_ASSISTANT_SOCKETS")) {
+        (Some(v), _) => v,
+        (None, Some(v)) => v
+            .trim()
+            .parse()
+            .with_context(|| format!("无法解析辅助 socket 数 `{v}`"))?,
+        (None, None) => DEFAULT_ASSISTANT_SOCKETS,
+    };
+
+    Ok(Rustp2pSettings {
+        node_id: node_id.unwrap_or_default().to_string(),
+        identity_file,
+        bind,
+        bootstrap: bootstrap_addrs,
+        stun_servers: stun_list,
+        max_assistant_sockets,
     })
 }
 
@@ -250,10 +487,25 @@ fn resolve_relay_mode(
 }
 
 /// 白名单：CLI `--allow` > `IRT_ALLOW`。
-fn resolve_allow_list(args: &ServerArgs, env: &EnvSource) -> anyhow::Result<Vec<EndpointId>> {
-    let mut raw: Vec<String> = args.allow.clone();
-    raw.extend(env.get_list("IRT_ALLOW"));
-    raw.iter().map(|s| parse_endpoint_id(s)).collect()
+fn resolve_allow_list(
+    args: &ServerArgs,
+    env: &EnvSource,
+    transport: TransportKind,
+) -> anyhow::Result<(Vec<EndpointId>, Vec<String>)> {
+    match transport {
+        TransportKind::Iroh => {
+            let mut raw: Vec<String> = args.allow.clone();
+            raw.extend(env.get_list("IRT_ALLOW"));
+            let list = raw.iter().map(|s| parse_endpoint_id(s)).collect::<Result<Vec<_>, _>>()?;
+            Ok((list, Vec::new()))
+        }
+        TransportKind::Rustp2p => {
+            // rustp2p 的 peer id 是任意字符串 —— **不能**按 endpoint id 解析。
+            let mut raw: Vec<String> = args.allow_peer.clone();
+            raw.extend(env.get_list("IRT_ALLOW_PEERS"));
+            Ok((Vec::new(), raw))
+        }
+    }
 }
 
 /// 解析 endpoint id。
@@ -501,18 +753,18 @@ Wf86aX6PepsntZv2GYlA5UpabfT2EZICICpJ5h/iI+i341gBmLiAFQOyTDT+/wQc
     fn client_parses_remote_endpoint_id() {
         let id = "86e9c0158a1f097baf3b17ce917501f5e4e3c244cf9cf57f39dcb187e9e09440";
         let args = ClientArgs {
-            remote: id.to_string(),
+            remote: Some(id.to_string()),
             ..Default::default()
         };
         let cfg = resolve_client(&args, &env(&[])).unwrap();
-        assert_eq!(cfg.remote.to_string(), id);
+        assert_eq!(cfg.remote.unwrap().to_string(), id);
     }
 
     #[test]
     fn client_trims_whitespace_around_endpoint_id() {
         let id = "86e9c0158a1f097baf3b17ce917501f5e4e3c244cf9cf57f39dcb187e9e09440";
         let args = ClientArgs {
-            remote: format!("  {id}\n"),
+            remote: Some(format!("  {id}\n")),
             ..Default::default()
         };
         assert!(resolve_client(&args, &env(&[])).is_ok());
@@ -542,11 +794,11 @@ Wf86aX6PepsntZv2GYlA5UpabfT2EZICICpJ5h/iI+i341gBmLiAFQOyTDT+/wQc
     fn client_uppercase_endpoint_id_is_accepted() {
         let id = "86E9C0158A1F097BAF3B17CE917501F5E4E3C244CF9CF57F39DCB187E9E09440";
         let args = ClientArgs {
-            remote: id.to_string(),
+            remote: Some(id.to_string()),
             ..Default::default()
         };
         let cfg = resolve_client(&args, &env(&[])).unwrap();
-        assert_eq!(cfg.remote.to_string(), id.to_ascii_lowercase());
+        assert_eq!(cfg.remote.unwrap().to_string(), id.to_ascii_lowercase());
     }
 
     #[test]
@@ -564,7 +816,7 @@ Wf86aX6PepsntZv2GYlA5UpabfT2EZICICpJ5h/iI+i341gBmLiAFQOyTDT+/wQc
     #[test]
     fn client_invalid_endpoint_id_is_rejected_and_mentions_it() {
         let args = ClientArgs {
-            remote: "not-an-id".into(),
+            remote: Some("not-an-id".to_string()),
             ..Default::default()
         };
         let err = resolve_client(&args, &env(&[])).unwrap_err().to_string();
@@ -574,7 +826,7 @@ Wf86aX6PepsntZv2GYlA5UpabfT2EZICICpJ5h/iI+i341gBmLiAFQOyTDT+/wQc
     #[test]
     fn client_key_file_defaults_to_a_dedicated_file() {
         let args = ClientArgs {
-            remote: "86e9c0158a1f097baf3b17ce917501f5e4e3c244cf9cf57f39dcb187e9e09440".into(),
+            remote: Some("86e9c0158a1f097baf3b17ce917501f5e4e3c244cf9cf57f39dcb187e9e09440".to_string()),
             ..Default::default()
         };
         let cfg = resolve_client(&args, &env(&[])).unwrap();
@@ -587,7 +839,7 @@ Wf86aX6PepsntZv2GYlA5UpabfT2EZICICpJ5h/iI+i341gBmLiAFQOyTDT+/wQc
     #[test]
     fn client_key_file_env_overrides_default() {
         let args = ClientArgs {
-            remote: "86e9c0158a1f097baf3b17ce917501f5e4e3c244cf9cf57f39dcb187e9e09440".into(),
+            remote: Some("86e9c0158a1f097baf3b17ce917501f5e4e3c244cf9cf57f39dcb187e9e09440".to_string()),
             ..Default::default()
         };
         let cfg = resolve_client(
@@ -601,7 +853,7 @@ Wf86aX6PepsntZv2GYlA5UpabfT2EZICICpJ5h/iI+i341gBmLiAFQOyTDT+/wQc
     #[test]
     fn client_listen_defaults_to_loopback_13389() {
         let args = ClientArgs {
-            remote: "86e9c0158a1f097baf3b17ce917501f5e4e3c244cf9cf57f39dcb187e9e09440".into(),
+            remote: Some("86e9c0158a1f097baf3b17ce917501f5e4e3c244cf9cf57f39dcb187e9e09440".to_string()),
             ..Default::default()
         };
         let cfg = resolve_client(&args, &env(&[])).unwrap();
@@ -611,7 +863,7 @@ Wf86aX6PepsntZv2GYlA5UpabfT2EZICICpJ5h/iI+i341gBmLiAFQOyTDT+/wQc
     #[test]
     fn client_listen_env_overrides_default() {
         let args = ClientArgs {
-            remote: "86e9c0158a1f097baf3b17ce917501f5e4e3c244cf9cf57f39dcb187e9e09440".into(),
+            remote: Some("86e9c0158a1f097baf3b17ce917501f5e4e3c244cf9cf57f39dcb187e9e09440".to_string()),
             ..Default::default()
         };
         let cfg = resolve_client(&args, &env(&[("IRT_LISTEN", "127.0.0.1:23389")])).unwrap();
@@ -634,7 +886,7 @@ Wf86aX6PepsntZv2GYlA5UpabfT2EZICICpJ5h/iI+i341gBmLiAFQOyTDT+/wQc
         let cfg = resolve_server(&ServerArgs::default(), &env(&[])).unwrap();
         assert_eq!(cfg.discovery, Discovery::Public);
         let args = ClientArgs {
-            remote: "86e9c0158a1f097baf3b17ce917501f5e4e3c244cf9cf57f39dcb187e9e09440".into(),
+            remote: Some("86e9c0158a1f097baf3b17ce917501f5e4e3c244cf9cf57f39dcb187e9e09440".to_string()),
             ..Default::default()
         };
         let cfg = resolve_client(&args, &env(&[])).unwrap();
@@ -680,5 +932,203 @@ Wf86aX6PepsntZv2GYlA5UpabfT2EZICICpJ5h/iI+i341gBmLiAFQOyTDT+/wQc
         };
         let cfg = resolve_server(&args, &env(&[])).unwrap();
         assert_eq!(cfg.discovery, Discovery::Disabled);
+    }
+
+    // ------------------------------------------------------------------
+    // 传输后端选择（v0.3）
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn transport_defaults_to_iroh() {
+        let args = ClientArgs {
+            remote: Some(
+                "86e9c0158a1f097baf3b17ce917501f5e4e3c244cf9cf57f39dcb187e9e09440".to_string(),
+            ),
+            ..Default::default()
+        };
+        let cfg = resolve_client(&args, &env(&[])).unwrap();
+        assert_eq!(cfg.transport, TransportKind::Iroh);
+    }
+
+    #[test]
+    fn transport_cli_selects_rustp2p() {
+        let args = ClientArgs {
+            transport: Some("rustp2p".to_string()),
+            peer: Some("peer-c".to_string()),
+            ..Default::default()
+        };
+        let cfg = resolve_client(&args, &env(&[])).unwrap();
+        assert_eq!(cfg.transport, TransportKind::Rustp2p);
+        assert_eq!(cfg.peer.as_deref(), Some("peer-c"));
+    }
+
+    #[test]
+    fn transport_cli_overrides_env() {
+        let args = ClientArgs {
+            transport: Some("rustp2p".to_string()),
+            peer: Some("peer-c".to_string()),
+            ..Default::default()
+        };
+        let cfg = resolve_client(&args, &env(&[("IRT_TRANSPORT", "iroh")])).unwrap();
+        assert_eq!(
+            cfg.transport,
+            TransportKind::Rustp2p,
+            "CLI 参数必须胜出环境变量"
+        );
+    }
+
+    #[test]
+    fn transport_from_env_when_cli_absent() {
+        let args = ClientArgs {
+            peer: Some("peer-c".to_string()),
+            ..Default::default()
+        };
+        let cfg = resolve_client(&args, &env(&[("IRT_TRANSPORT", "rustp2p")])).unwrap();
+        assert_eq!(cfg.transport, TransportKind::Rustp2p);
+    }
+
+    #[test]
+    fn unknown_transport_is_rejected() {
+        let args = ClientArgs {
+            transport: Some("quic".to_string()),
+            ..Default::default()
+        };
+        let err = resolve_client(&args, &env(&[])).unwrap_err();
+        assert!(
+            err.to_string().contains("未知的传输后端"),
+            "错误信息应说清楚: {err}"
+        );
+    }
+
+    #[test]
+    fn rustp2p_requires_peer_id() {
+        let args = ClientArgs {
+            transport: Some("rustp2p".to_string()),
+            ..Default::default()
+        };
+        let err = resolve_client(&args, &env(&[])).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("peer id"),
+            "错误信息应提到 peer id，实际: {msg}"
+        );
+    }
+
+    #[test]
+    fn rustp2p_peer_can_come_from_positional_arg() {
+        let args = ClientArgs {
+            transport: Some("rustp2p".to_string()),
+            remote: Some("peer-from-positional".to_string()),
+            ..Default::default()
+        };
+        let cfg = resolve_client(&args, &env(&[])).unwrap();
+        assert_eq!(cfg.peer.as_deref(), Some("peer-from-positional"));
+    }
+
+    #[test]
+    fn iroh_still_requires_endpoint_id() {
+        let args = ClientArgs {
+            transport: Some("iroh".to_string()),
+            ..Default::default()
+        };
+        let err = resolve_client(&args, &env(&[])).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("endpoint id"),
+            "iroh 模式仍必须提供 endpoint id"
+        );
+    }
+
+    #[test]
+    fn bootstrap_list_keeps_cli_order() {
+        let args = ServerArgs {
+            transport: Some("rustp2p".to_string()),
+            bootstrap: vec!["10.0.0.1:7001".to_string(), "10.0.0.2:7001".to_string()],
+            ..Default::default()
+        };
+        let cfg = resolve_server(&args, &env(&[])).unwrap();
+        let got: Vec<String> = cfg
+            .rustp2p
+            .bootstrap
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        assert_eq!(got, vec!["10.0.0.1:7001", "10.0.0.2:7001"]);
+    }
+
+    #[test]
+    fn bootstrap_from_env_when_cli_absent() {
+        let args = ServerArgs {
+            transport: Some("rustp2p".to_string()),
+            ..Default::default()
+        };
+        let cfg = resolve_server(
+            &args,
+            &env(&[("IRT_BOOTSTRAP", "10.0.0.9:7001, 10.0.0.8:7001")]),
+        )
+        .unwrap();
+        assert_eq!(cfg.rustp2p.bootstrap.len(), 2);
+        assert_eq!(cfg.rustp2p.bootstrap[0].to_string(), "10.0.0.9:7001");
+    }
+
+    #[test]
+    fn invalid_bootstrap_address_is_rejected() {
+        let args = ServerArgs {
+            transport: Some("rustp2p".to_string()),
+            bootstrap: vec!["not-an-addr".to_string()],
+            ..Default::default()
+        };
+        assert!(resolve_server(&args, &env(&[])).is_err());
+    }
+
+    #[test]
+    fn stun_defaults_to_builtin_servers() {
+        let args = ServerArgs {
+            transport: Some("rustp2p".to_string()),
+            ..Default::default()
+        };
+        let cfg = resolve_server(&args, &env(&[])).unwrap();
+        assert_eq!(cfg.rustp2p.stun_servers.len(), 3);
+        assert!(cfg.rustp2p.stun_servers[0].contains("stun."));
+    }
+
+    #[test]
+    fn stun_cli_overrides_default() {
+        let args = ServerArgs {
+            transport: Some("rustp2p".to_string()),
+            stun: vec!["stun.example.org:3478".to_string()],
+            ..Default::default()
+        };
+        let cfg = resolve_server(&args, &env(&[])).unwrap();
+        assert_eq!(cfg.rustp2p.stun_servers, vec!["stun.example.org:3478"]);
+    }
+
+    #[test]
+    fn assistant_sockets_default_and_override() {
+        let args = ServerArgs {
+            transport: Some("rustp2p".to_string()),
+            ..Default::default()
+        };
+        let cfg = resolve_server(&args, &env(&[])).unwrap();
+        assert_eq!(cfg.rustp2p.max_assistant_sockets, 4);
+
+        let args = ServerArgs {
+            transport: Some("rustp2p".to_string()),
+            assistant_sockets: Some(9),
+            ..Default::default()
+        };
+        let cfg = resolve_server(&args, &env(&[])).unwrap();
+        assert_eq!(cfg.rustp2p.max_assistant_sockets, 9);
+    }
+
+    #[test]
+    fn rustp2p_allow_peer_is_not_parsed_as_endpoint_id() {
+        let args = ServerArgs {
+            transport: Some("rustp2p".to_string()),
+            allow_peer: vec!["peer-c".to_string()],
+            ..Default::default()
+        };
+        let cfg = resolve_server(&args, &env(&[])).unwrap();
+        assert_eq!(cfg.allow_peers, vec!["peer-c".to_string()]);
+        assert!(cfg.allow_list.is_empty());
     }
 }

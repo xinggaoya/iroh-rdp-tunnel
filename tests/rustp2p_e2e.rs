@@ -52,12 +52,13 @@ async fn spawn_node(
     Rustp2pTransport::build(
         &Rustp2pOptions {
             peer_id: peer_id.to_string(),
-            seed: format!("{peer_id}-seed"),
+            seed: format!("{peer_id}-seed").into_bytes(),
             bind: "127.0.0.1:0".parse().unwrap(),
             bootstrap,
             stun_servers: Vec::new(),
             max_assistant_sockets: 2,
             punch_whitelist: None,
+            allow_list: Vec::new(),
         },
         watched,
     )

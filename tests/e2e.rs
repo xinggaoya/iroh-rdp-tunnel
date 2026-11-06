@@ -77,6 +77,9 @@ async fn start_server(
         allow_list,
         discovery: Discovery::Disabled,
         ca_tls_config: Some(iroh::tls::CaTlsConfig::insecure_skip_verify()),
+        allow_peers: vec![],
+        transport: iroh_rdp_tunnel::transport::TransportKind::Iroh,
+        rustp2p: Default::default(),
     };
     let rt = server::build(&cfg).await.unwrap();
     // 等被控端连上 relay，否则控制端拨过去时 relay 还不认识它。

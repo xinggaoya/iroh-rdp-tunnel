@@ -18,8 +18,13 @@ use crate::{
     BUILD_TAG,
     config::ClientConfig,
     endpoint::{EndpointOptions, bind_resolver_only},
-    keys::{load_or_create_secret_key, write_endpoint_id_hint},
-    transport::{PeerRef, TransportEndpoint, iroh::IrohTransport},
+    keys::{load_or_create_secret_key, load_or_create_rustp2p_identity, write_endpoint_id_hint},
+    transport::{
+        PeerRef, TransportEndpoint, TransportKind,
+        iroh::IrohTransport,
+        rustp2p::{Rustp2pOptions, Rustp2pTransport},
+        spawn_path_reporter,
+    },
     tunnel::bridge_tcp_to_stream,
 };
 
@@ -35,7 +40,95 @@ use crate::{
 const NET_REPORT_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// 运行控制端。
+///
+/// 按传输后端分派：iroh 走 n0 公共中继与 pkarr 发现；
+/// rustp2p 走自建中继与端口预测打洞（能对付对称 NAT）。
 pub async fn run(cfg: ClientConfig) -> Result<()> {
+    match cfg.transport {
+        TransportKind::Iroh => run_iroh(cfg).await,
+        TransportKind::Rustp2p => run_rustp2p(cfg).await,
+    }
+}
+
+/// rustp2p 后端的控制端。
+///
+/// 与 iroh 路径的差别：
+/// - 对端用 **peer id** 而不是 endpoint id；
+/// - 需要 bootstrap 节点（公网 VPS，兼作中继）；
+/// - 打洞由 rustp2p 的端口预测 + 扫描自动完成，不需要手工干预。
+async fn run_rustp2p(cfg: ClientConfig) -> Result<()> {
+    let peer_id = cfg
+        .peer
+        .clone()
+        .context("缺少对端 peer id（--peer 或位置参数）")?;
+
+    // node_id 留空 = 让它随机生成并持久化 —— 空字符串不是合法 peer id。
+    let requested = (!cfg.rustp2p.node_id.trim().is_empty())
+        .then_some(cfg.rustp2p.node_id.as_str());
+    let identity = load_or_create_rustp2p_identity(&cfg.rustp2p.identity_file, requested)?;
+
+    let opts = Rustp2pOptions {
+        peer_id: identity.peer_id.clone(),
+        seed: identity.seed.clone(),
+        bind: cfg.rustp2p.bind,
+        bootstrap: cfg.rustp2p.bootstrap.clone(),
+        stun_servers: cfg.rustp2p.stun_servers.clone(),
+        max_assistant_sockets: cfg.rustp2p.max_assistant_sockets,
+        punch_whitelist: None,
+        allow_list: Vec::new(),
+    };
+    let transport = Rustp2pTransport::build(
+        &opts,
+        vec![rustp2p_quic::PeerId::new(peer_id.clone())],
+    )
+    .await?;
+
+    let listener = TcpListener::bind(cfg.listen)
+        .await
+        .with_context(|| format!("无法绑定本地 TCP {}", cfg.listen))?;
+
+    println!();
+    println!("=========================================================");
+    println!(" iroh-rdp-tunnel CLIENT  ({BUILD_TAG})  [rustp2p]");
+    println!("=========================================================");
+    println!(" 本机 peer id : {}", identity.peer_id);
+    println!(" 对端 peer id : {peer_id}");
+    if cfg.rustp2p.bootstrap.is_empty() {
+        println!(" bootstrap    : （未指定）—— 没有 bootstrap 就发现不了对端！");
+    } else {
+        let list = cfg
+            .rustp2p
+            .bootstrap
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(" bootstrap    : {list}");
+    }
+    println!(" STUN         : {}", cfg.rustp2p.stun_servers.join(", "));
+    println!(" 本地 TCP 监听 : {}", cfg.listen);
+    println!();
+    println!(" 用系统自带的远程桌面连接本机端口:");
+    println!("     Windows : mstsc /v:{}", cfg.listen);
+    println!(" (Ctrl-C 退出)");
+    println!();
+
+    // 路径可观测：直连 / 中继的迁移。
+    spawn_path_reporter(transport.as_ref(), "client");
+
+    tokio::select! {
+        r = serve_local(transport.clone(), PeerRef::Rustp2p(peer_id), listener) => r,
+        r = tokio::signal::ctrl_c() => {
+            r?;
+            println!("\n正在关闭…");
+            transport.close().await;
+            Ok(())
+        }
+    }
+}
+
+/// iroh 后端的控制端（v0.2 的既有路径，行为不变）。
+async fn run_iroh(cfg: ClientConfig) -> Result<()> {
     // 控制端也持久化自己的私钥：id 固定之后才能写进被控端的 `--allow` 白名单。
     let secret_key = load_or_create_secret_key(&cfg.key_file)?;
     let local_id = secret_key.public();
@@ -71,8 +164,11 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
     }
 
     // 后台立即开始建连（打洞也随之开始），不等到用户打开 mstsc。
-    let transport = IrohTransport::new_client(endpoint.clone(), cfg.remote, None);
-    let peer = PeerRef::Iroh(cfg.remote);
+    let remote = cfg
+        .remote
+        .context("iroh 后端缺少远端 endpoint id")?;
+    let transport = IrohTransport::new_client(endpoint.clone(), remote, None);
+    let peer = PeerRef::Iroh(remote);
 
     let listener = TcpListener::bind(cfg.listen)
         .await
@@ -82,7 +178,7 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
     println!("=========================================================");
     println!(" iroh-rdp-tunnel CLIENT  ({BUILD_TAG})");
     println!("=========================================================");
-    println!(" 远端 endpoint : {}", cfg.remote);
+    println!(" 远端 endpoint : {}", remote);
     println!(" 本机 endpoint : {local_id}");
     println!("                 （可写进被控端的 --allow 白名单）");
     println!(" 本地 TCP 监听 : {}", cfg.listen);

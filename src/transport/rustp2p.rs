@@ -64,13 +64,16 @@ const READ_CHUNK: usize = 16 * 1024;
 /// 路径状态的轮询间隔。
 const PATH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// 等待对端被 bootstrap 发现的上限。
+const PEER_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// rustp2p 传输端点的配置。
 #[derive(Debug, Clone)]
 pub struct Rustp2pOptions {
     /// 本端 peer id（任意字符串）。
     pub peer_id: String,
     /// 证书种子 —— **必须持久化**，否则重启后身份会变。
-    pub seed: String,
+    pub seed: Vec<u8>,
     /// 本地监听地址。
     pub bind: SocketAddr,
     /// bootstrap 节点地址（公网 VPS 上的 node）。
@@ -81,18 +84,25 @@ pub struct Rustp2pOptions {
     pub max_assistant_sockets: usize,
     /// 允许参与打洞的 peer 白名单；`None` 表示不限制。
     pub punch_whitelist: Option<Vec<String>>,
+    /// 允许接入的 peer id 白名单；空表示不限制。
+    ///
+    /// **注意这只是字符串比对，不是身份认证** —— rustp2p 的 peer id 是
+    /// 应用层任意字符串，证书校验又被降级为跳过。所以它挡不住有意伪造，
+    /// 只挡「手滑连错机器」。见设计文档 §9.4。
+    pub allow_list: Vec<String>,
 }
 
 impl Default for Rustp2pOptions {
     fn default() -> Self {
         Self {
             peer_id: "irt-node".to_string(),
-            seed: "irt-node-seed".to_string(),
+            seed: b"irt-node-seed".to_vec(),
             bind: "0.0.0.0:0".parse().expect("固定地址可解析"),
             bootstrap: Vec::new(),
             stun_servers: Vec::new(),
             max_assistant_sockets: 4,
             punch_whitelist: None,
+            allow_list: Vec::new(),
         }
     }
 }
@@ -123,7 +133,7 @@ impl Rustp2pTransport {
         opts: &Rustp2pOptions,
         watched: Vec<PeerId>,
     ) -> Result<Arc<Self>> {
-        let identity = Identity::new(opts.peer_id.clone(), opts.seed.as_bytes())
+        let identity = Identity::new(opts.peer_id.clone(), &opts.seed)
             .map_err(|e| anyhow::anyhow!("创建 rustp2p 身份失败: {e}"))?;
 
         let mut builder = Endpoint::builder()
@@ -157,7 +167,7 @@ impl Rustp2pTransport {
             watched: Arc::new(Mutex::new(watched)),
         });
 
-        transport.spawn_accept_loop(tx);
+        transport.spawn_accept_loop(tx, opts.allow_list.clone());
         transport.spawn_path_poller();
         Ok(transport)
     }
@@ -185,8 +195,13 @@ impl Rustp2pTransport {
     }
 
     /// 后台任务：接受入站双向流。
-    fn spawn_accept_loop(self: &Arc<Self>, tx: mpsc::UnboundedSender<Result<AcceptedStream>>) {
+    fn spawn_accept_loop(
+        self: &Arc<Self>,
+        tx: mpsc::UnboundedSender<Result<AcceptedStream>>,
+        allow_list: Vec<String>,
+    ) {
         let endpoint = self.endpoint.clone();
+        let watched = self.watched.clone();
         tokio::spawn(async move {
             loop {
                 let incoming = match endpoint.accept_bi().await {
@@ -199,7 +214,19 @@ impl Rustp2pTransport {
                     }
                 };
                 let peer = incoming.peer_id.clone();
+                if !allow_list.is_empty() && !allow_list.iter().any(|a| a == peer.as_str()) {
+                    // 只是字符串比对，不是认证（见 Rustp2pOptions::allow_list 的说明）。
+                    tracing::warn!("peer {peer} 不在白名单内，拒绝接入");
+                    continue;
+                }
                 tracing::info!("收到来自 {peer} 的双向流");
+                // 把入站对端加入「被关注」列表 —— 路径报告只关心它。
+                {
+                    let mut w = watched.lock().unwrap();
+                    if !w.contains(&peer) {
+                        w.push(peer.clone());
+                    }
+                }
                 let stream = Rustp2pStream::new(incoming.send, incoming.recv);
                 if tx
                     .send(Ok(AcceptedStream {
@@ -225,16 +252,19 @@ impl Rustp2pTransport {
         let watched = self.watched.clone();
 
         tokio::spawn(async move {
-            let mut last: Option<(PeerId, PathState)> = None;
+            // 上一次的状态：(peer, 路径类型, 远端标识)。
+            let mut last: Option<(PeerId, PathKind, String)> = None;
             loop {
                 tokio::time::sleep(PATH_POLL_INTERVAL).await;
 
-                // 关注的 peer 列表 + 已知 peer（server 侧的对端是动态出现的）。
-                let mut peers = watched.lock().unwrap().clone();
-                for p in endpoint.known_peers() {
-                    if !peers.contains(&p.peer_id) {
-                        peers.push(p.peer_id);
-                    }
+                // **只报告被关注的 peer**。
+                //
+                // 不能把 known_peers 全都算进来 —— 那会把 bootstrap 节点、
+                // 其它无关 peer 的路径也打印出来，淹没真正的对端状态。
+                // server 侧的对端在收到入站流时由 `watch_peer` 动态加入。
+                let peers = watched.lock().unwrap().clone();
+                if peers.is_empty() {
+                    continue;
                 }
 
                 for peer in &peers {
@@ -264,12 +294,19 @@ impl Rustp2pTransport {
                                 .map(|ms| Duration::from_millis(ms as u64)),
                         },
                     };
-                    let changed = last.as_ref() != Some(&(peer.clone(), current.clone()));
+                    // 去重时**忽略 rtt** —— RTT 每秒都在微变，
+                    // 拿它做判据会疯狂刷屏。
+                    let changed = match last.as_ref() {
+                        Some((p, k, r)) => p != peer || k != &current_kind(&current) || r != &current_remote(&current),
+                        None => true,
+                    };
                     if changed {
-                        last = Some((peer.clone(), current.clone()));
-                        if peers.first() == Some(peer) {
-                            *state.lock().unwrap() = current.clone();
-                        }
+                        last = Some((
+                            peer.clone(),
+                            current_kind(&current),
+                            current_remote(&current),
+                        ));
+                        *state.lock().unwrap() = current.clone();
                         let _ = events.send(crate::transport::to_event(&current));
                     }
                 }
@@ -279,6 +316,22 @@ impl Rustp2pTransport {
 }
 
 use std::time::Duration;
+
+use crate::pathinfo::PathKind;
+
+/// 取路径状态里的「路径类型」。
+fn current_kind(state: &PathState) -> PathKind {
+    match state {
+        PathState::Direct { .. } => PathKind::Direct,
+        PathState::Relay { .. } => PathKind::Relay,
+        _ => PathKind::Relay,
+    }
+}
+
+/// 取路径状态里的「远端标识」。
+fn current_remote(state: &PathState) -> String {
+    state.remote().unwrap_or_default().to_string()
+}
 
 #[async_trait::async_trait]
 impl TransportEndpoint for Rustp2pTransport {
@@ -295,6 +348,26 @@ impl TransportEndpoint for Rustp2pTransport {
             anyhow::bail!("rustp2p 后端只能连接 rustp2p 类型的对端标识");
         };
         let peer_id = PeerId::new(id.clone());
+
+        // **必须先等对端出现在已知列表里**。
+        //
+        // rustp2p 的 `open_bi` 内部是「连不上就重试两次」，而每次重试都会
+        // 等路由建立 —— 对端还没被 bootstrap 的 peer 列表发现时，
+        // 路由根本不存在，于是这一步会一直挂着，既不报错也不推进。
+        //
+        // 对端的出现靠 bootstrap 交换 peer 列表，通常几秒内完成。
+        let deadline = std::time::Instant::now() + PEER_DISCOVERY_TIMEOUT;
+        while !self.endpoint.known_peers().iter().any(|p| p.peer_id == peer_id) {
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "等待对端 {id} 出现超时（{} 秒）—— 检查 bootstrap 是否可达、                     两端是否连的是同一个 bootstrap",
+                    PEER_DISCOVERY_TIMEOUT.as_secs()
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        tracing::debug!("对端 {id} 已出现，打开双向流");
+
         let (send, recv) = self
             .endpoint
             .open_bi(peer_id)
