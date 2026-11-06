@@ -30,4 +30,4 @@ pub const RDP_LOCAL: &str = "127.0.0.1:3389";
 pub const LISTEN_ADDR: &str = "127.0.0.1:13389";
 
 /// 构建标记 —— 启动时打印，方便区分新旧二进制。
-pub const BUILD_TAG: &str = "v0.3.0";
+pub const BUILD_TAG: &str = "v0.3.1";
