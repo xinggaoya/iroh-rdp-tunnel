@@ -37,7 +37,7 @@ use std::task::{Context, Poll};
 use anyhow::Result;
 use rustp2p_quic::{Endpoint, Identity, PeerId};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 
 use crate::{
     pathinfo::spawn_transport_reporter,
@@ -54,7 +54,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 32;
 ///
 /// 容量小是为了尽快把背压传回上层：quinn 的流控窗口满时，
 /// 后台任务会卡在 `write_all` 上，channel 随之填满。
-const WRITE_CHANNEL_CAPACITY: usize = 2;
+const WRITE_CHANNEL_CAPACITY: usize = 64;
 
 /// 读通道的容量。
 const READ_CHANNEL_CAPACITY: usize = 8;
@@ -408,12 +408,6 @@ impl TransportEndpoint for Rustp2pTransport {
     }
 }
 
-/// 等待中的写命令发送 future。
-///
-/// `mpsc::Sender::send` 返回的 future 借用 sender，所以用 `async move` 包一层，
-/// 让它 own 住 sender —— 这样 future 才是 `'static`，能存进结构体。
-type PendingWrite = Pin<Box<dyn Future<Output = Result<(), mpsc::error::SendError<WriteCmd>>> + Send>>;
-
 /// 等待中的写半边关闭 future。
 type PendingFinish = Pin<Box<dyn Future<Output = io::Result<()>> + Send>>;
 
@@ -429,8 +423,19 @@ enum WriteCmd {
 pub struct Rustp2pStream {
     /// 写命令发送端。
     write_tx: mpsc::Sender<WriteCmd>,
-    /// 等待中的写命令发送 future（用于背压）。
-    write_pending: Option<PendingWrite>,
+    /// **还没被底层接受**的数据。
+    ///
+    /// `AsyncWrite` 的契约要求：`poll_write` 返回 `Pending` 时**绝不能**已经
+    /// 接受了数据 —— 否则上层会带着一份「更长的 buf」重试（tokio 的 `copy`
+    /// 在 `poll_write` 挂起期间会继续 `poll_read` 往 buf 里追加），
+    /// 旧数据就会被重复发送。
+    ///
+    /// 所以 channel 满时，数据先留在这里，等有空位再送出去。
+    pending_data: Vec<u8>,
+    /// 「写通道有空位了」的通知（后台任务消费时唤醒等待者）。
+    write_space: Arc<Notify>,
+    /// 等待写通道空位的 future。
+    write_space_waiter: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     /// 等待中的写半边关闭 future。
     finish_pending: Option<PendingFinish>,
     /// 读数据接收端。
@@ -451,11 +456,15 @@ impl Rustp2pStream {
     ) -> Self {
         let (write_tx, mut write_rx) = mpsc::channel::<WriteCmd>(WRITE_CHANNEL_CAPACITY);
         let (read_tx, read_rx) = mpsc::channel::<io::Result<Vec<u8>>>(READ_CHANNEL_CAPACITY);
+        let write_space = Arc::new(Notify::new());
+        let write_space2 = Arc::clone(&write_space);
 
         // 写任务：按序把数据交给 QUIC。
         tokio::spawn(async move {
             let mut send = send;
             while let Some(cmd) = write_rx.recv().await {
+                // 消费了一个命令 ⇒ 通道里有空位了 ⇒ 唤醒可能挂着的写者。
+                write_space2.notify_waiters();
                 match cmd {
                     WriteCmd::Data(data) => {
                         if let Err(e) = send.write_all(&data).await {
@@ -494,12 +503,27 @@ impl Rustp2pStream {
 
         Self {
             write_tx,
-            write_pending: None,
+            pending_data: Vec::new(),
+            write_space,
+            write_space_waiter: None,
             finish_pending: None,
             read_rx,
             read_buf: Vec::new(),
             read_pos: 0,
             read_done: false,
+        }
+    }
+}
+
+impl Rustp2pStream {
+    /// 等写通道腾出空位。
+    ///
+    /// 后台任务每消费一个命令就会 `notify_waiters()`。
+    fn wait_for_write_space(&mut self, cx: &mut Context<'_>) {
+        let notify = Arc::clone(&self.write_space);
+        let mut waiter = Box::pin(async move { notify.notified().await });
+        if waiter.as_mut().poll(cx).is_pending() {
+            self.write_space_waiter = Some(waiter);
         }
     }
 }
@@ -553,35 +577,50 @@ impl AsyncWrite for Rustp2pStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+
+        // 1) 先把上次没被接受的数据送出去。
+        if !this.pending_data.is_empty() {
+            let data = std::mem::take(&mut this.pending_data);
+            match this.write_tx.try_send(WriteCmd::Data(data)) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(cmd)) => {
+                    let WriteCmd::Data(data) = cmd else {
+                        return Poll::Ready(Err(broken_pipe()));
+                    };
+                    this.pending_data = data;
+                    this.wait_for_write_space(cx);
+                    return Poll::Pending;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Poll::Ready(Err(broken_pipe()));
+                }
+            }
+        }
+
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
 
-        // 上一次发送还没完成 —— 先等它。
-        if let Some(fut) = this.write_pending.as_mut() {
-            match fut.as_mut().poll(cx) {
-                Poll::Ready(Ok(())) => this.write_pending = None,
-                Poll::Ready(Err(_)) => {
-                    this.write_pending = None;
-                    return Poll::Ready(Err(broken_pipe()));
-                }
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        // 发送新数据。channel 满了就返回 Pending —— 背压。
-        // 必须先克隆 sender：否则 future 借用 `this`，存不进 'static 的槽位。
-        let tx = this.write_tx.clone();
-        let data = buf.to_vec();
-        // 用 async move 包一层：`Sender::send` 返回的 future 借用 sender，
-        // 而槽位要求 'static —— async block 把 sender 收进自己的状态里。
-        let mut fut = Box::pin(async move { tx.send(WriteCmd::Data(data)).await });
-        match fut.as_mut().poll(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),
-            Poll::Ready(Err(_)) => Poll::Ready(Err(broken_pipe())),
-            Poll::Pending => {
-                this.write_pending = Some(fut);
+        // 2) 发送新数据。
+        //
+        // 用 `try_send` 而不是 `send().await`：`send` 的 future 一旦被 poll
+        // 就可能把数据**放进队列**，此时若返回 `Pending`，上层会以为数据没被
+        // 接受、用更大的 buf 重试 ⇒ 旧数据被重复发送。
+        //
+        // `try_send` 失败 ⇒ 数据**一定**没被接受 ⇒ 返回 `Pending` 是诚实的。
+        let n = buf.len();
+        match this.write_tx.try_send(WriteCmd::Data(buf.to_vec())) {
+            Ok(()) => Poll::Ready(Ok(n)),
+            Err(mpsc::error::TrySendError::Full(cmd)) => {
+                    let WriteCmd::Data(data) = cmd else {
+                        return Poll::Ready(Err(broken_pipe()));
+                    };
+                this.pending_data = data;
+                this.wait_for_write_space(cx);
                 Poll::Pending
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Poll::Ready(Err(broken_pipe()))
             }
         }
     }

@@ -61,6 +61,7 @@ async fn spawn_node(
             allow_list: Vec::new(),
         },
         watched,
+        "test",
     )
     .await
     .expect("建立 rustp2p 节点失败")
@@ -177,4 +178,52 @@ async fn rustp2p_reports_direct_path_on_loopback() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     assert!(direct, "回环上应当判定为直连，实际: {:?}", client.path_state());
+}
+
+/// 大流量传输 —— **专门盯住 `poll_write` 的契约**。
+///
+/// 曾经的 bug：`poll_write` 返回 `Pending` 时数据其实已经进了队列，
+/// 上层（tokio 的 `copy`）会带着一份**更长的 buf** 重试 ⇒ 旧数据被重复发送。
+/// 小包（≤ 32 KB）不一定触发，1 MB 必现。
+#[tokio::test]
+async fn rustp2p_tunnel_roundtrips_large_payload() {
+    let (server, client) = spawn_topology().await;
+
+    let server_task = tokio::spawn(async move {
+        let accepted = server.accept_stream().await.expect("应接受到入站流");
+        let mut stream = accepted.stream;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut total = 0usize;
+        loop {
+            let n = stream.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            total += n;
+            stream.write_all(&buf[..n]).await.unwrap();
+        }
+        stream.shutdown().await.unwrap();
+        total
+    });
+
+    let mut stream = client
+        .open_stream(&PeerRef::Rustp2p("server".to_string()))
+        .await
+        .expect("应能打开双向流");
+
+    let payload: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let expect_len = payload.len();
+    stream.write_all(&payload).await.unwrap();
+    stream.shutdown().await.unwrap();
+
+    let mut got = Vec::new();
+    stream.read_to_end(&mut got).await.unwrap();
+
+    assert_eq!(
+        got.len(),
+        expect_len,
+        "字节数必须一致 —— 多出来说明 poll_write 违反契约导致重复"
+    );
+    assert_eq!(got, payload, "字节必须逐字节一致");
+    assert_eq!(server_task.await.unwrap(), expect_len);
 }
