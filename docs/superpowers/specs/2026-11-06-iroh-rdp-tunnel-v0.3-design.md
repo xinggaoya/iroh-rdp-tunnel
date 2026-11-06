@@ -177,6 +177,32 @@ VPS 跑 `vnts`，两端跑 `vnt2_cli`，用它的端口映射把本地 `13389` �
 2. `[路径·server]` 的 RTT **< 100ms**
 3. RDP 实际可用（mstsc 拖窗口流畅）
 
+### 6.4 配置样例（结构已核对 `iroh-relay/src/main.rs`）
+
+```toml
+# /etc/iroh-relay/config.toml
+enable_relay = true
+http_bind_addr = "[::]:80"
+https_bind_addr = "[::]:443"       # 在 tls 段内
+enable_quic_addr_discovery = true   # ⚠️ 默认 false，必须显式开
+enable_metrics = true
+metrics_bind_addr = "[::]:9090"
+
+[tls]
+cert = "/etc/iroh-relay/cert.pem"
+key  = "/etc/iroh-relay/key.pem"
+```
+
+⚠️ **`tls` 段是 `enable_quic_addr_discovery = true` 的前提**
+（源码注释：*“Must exist if `enable_quic_addr_discovery` is `true`”*），
+且**没有 tls 段时 relay 服务会降级到明文 HTTP** —— 两端都需 `--ca-file`。
+
+### 6.5 Docker 形态
+
+VPS 条件已确认可跑 Docker ⇒ 用官方镜像或固定版本的 release 二进制。
+镜像需能挂载 `config.toml` 与证书；**必须确认镜像里的配置也开启了
+`enable_quic_addr_discovery`**（镜像可能带自己的默认配置）。
+
 ---
 
 ## 7. 阶段 2 详细设计：集成 rustp2p
@@ -220,12 +246,13 @@ src/
   任何可达的节点都能为其他 peer 转发。VPS 上跑一个 rustp2p-quic node 即可，
   它的角色是 bootstrap（入口）+ relay（转发）+ NAT 观测者。
   （`vnts` 是 vnt-core 的 protobuf/WebSocket 协议服务端，**与 rustp2p 不兼容**，不用。）
-- **身份与加密**：rustp2p-quic 的 `PeerId` 是**任意字符串**，证书来自 seed 且
-  默认 `SkipCertificateVerification`。我们要**保留 v0.2 的安全姿态**：
-  ① `PeerId` 用我们现有的 endpoint id（ed25519 公钥指纹）；
-  ② 自签证书 + `Builder::certificate_verifier` 做**公钥固定**；
-  ③ `--allow` 白名单在 accept 路径上强制。
-  （见 §9「待用户确认」Q2 —— 若用户接受降级，工作量会小很多，但那是安全回退。）
+- **身份与加密**：rustp2p-quic 的 `PeerId` 是**任意字符串**（`PeerId(pub String)`），
+  证书来自 seed 且默认 `SkipCertificateVerification`。
+  **用户已拍板降级为 rustp2p 默认**（见 §9.4 的风险陈述与缓解措施）：
+  ① `PeerId` 用随机长字符串（沿用 `src/keys.rs` 持久化，CLI 形态不变）；
+  ② 不做证书固定，QUIC 加密仍在（中继不终结流）；
+  ③ `--allow` 保留但降为字符串比对；
+  ④ VPS node 用 `punch_whitelist` 把暴露面缩到「知道 PeerId 的人」。
 - **回退**：保留 iroh 后端，`--transport` 切换；阶段 2 出问题可立即退回。
 
 ### 7.3 路径可观测的适配
@@ -279,6 +306,8 @@ v0.2 已经把「直连/中继」做成了明确信号（`🔓 公网直连路�
 | A3 | 阶段 2 用 rustp2p-core 还是 rustp2p-quic？ | **rustp2p-quic** —— 有真 QUIC streams（bridge 直接复用）、端到端 TLS、可注入证书校验器 |
 | A4 | 打洞的具体机制？ | 端口预测（`port_range × 10`，≥100）+ 全局随机扫描（1200~1500/轮，持久游标）+ assistant sockets |
 | A5 | iroh 后端是否长期保留？ | **保留**，加 `--transport` 切换；长期标记 deprecated 但不删 |
+| **A6** | **VPS 事实** | **公网 IPv4 + UDP 可达 + 有域名 + 能跑 Docker**（最理想）⇒ 域名做证书 SAN、Docker 跑 relay |
+| **A7** | **阶段 2 的安全姿态** | **降级为 rustp2p-quic 默认**：`PeerId` 为任意字符串、跳过证书校验。**用户已明确拍板**（见下方后果分析） |
 
 ### 9.2 我的决定（合理实现者也能自己定，已定并写入上文）
 
@@ -289,14 +318,42 @@ v0.2 已经把「直连/中继」做成了明确信号（`🔓 公网直连路�
 | M3 | **n0 回落：文档化的手动切换 + 可见告警**，不做自动故障转移 | `RelayMode::custom` 的 home relay 由 QAD 延迟选出且切换滞后；自动故障转移要额外的健康检查与切换机制，与「阶段 1 不改 Rust 代码」矛盾。阶段 1 的产物是部署手册，不是新功能 |
 | M4 | **STUN 服务器地址写入配置默认值**（`stun.miwifi.com:3478` 等） | rustp2p 的 `Config::default()` 的 `stun_servers` 是**空的**，而对称 NAT 的端口预测需要端口范围作为输入 |
 | M5 | 阶段 2 起步先做**可行性验证 spike**（最小 client/server 通过自建 node 完成发现+打洞+字节流），跑通才继续 | 风险最高的一环（协议栈版本匹配、API 稳定性）在投入前先验证 |
+| M6 | **打洞时间预算：5 分钟内命中即可；「最终仍走中继」是可接受结果** | 穷举扫完 65535 端口约 44 轮（≈分钟级）；且中继永远兜底（AG1），不值得为抢几分钟引入复杂的超时/重试逻辑 |
+| M7 | 降级后 `PeerId` 用**随机长字符串**（而非公钥指纹） | 既然不做密码学绑定，那「不可猜测」比「可推导」更重要；仍沿用 `src/keys.rs` 持久化 |
 
 ### 9.3 只有你能回答（会改变要做什么）
 
-| | 问题 | 为什么答案会改变计划 |
+**本轮已全部回答**（A6 / A7 / 下方打洞预算），故本节现为空。若实施中出现新分叉，
+按同样的三类方法重新归类。
+
+| | 问题 | 答案 |
 |---|---|---|
-| **Q1** | **VPS 的具体事实**：(a) 有公网 IPv4 且**无 NAT**、**UDP 可达**吗？(b) 有域名吗（证书 SAN 要匹配）？(c) 能跑 Docker 或 Rust ≥ 1.91 工具链吗？(d) 位置（国内/香港/海外）？ | 阶段 1 的全部交付物就是一份部署手册，没有 (a)(b)(c) 写不出来；(a) 不满足则 iroh-relay 的 QUIC 口打不开，阶段 1 根本跑不起来。位置决定 G1 的延迟目标值是否现实 |
-| **Q2** | **安全姿态**：阶段 2 是否必须保持 v0.2 的「公钥指纹身份 + 认证加密 + `--allow` 白名单」？还是接受 rustp2p-quic 的默认（`PeerId` 为任意字符串、默认跳过证书校验）？ | 这是**安全回退**，不能默默降级。保持则需实现证书固定 + 改造 `src/keys.rs`；不保持则 `irt` 会变成「任何能连上 VPS 的人都能接你的 RDP」 |
-| **Q3** | **打洞的时间预算**：可接受的直连耗时是多少（30s / 5min / 不限）？以及——**「最终仍走中继」是否算 v0.3 的可接受结果**？ | 决定是否需要打洞进度状态机与超时提示，以及 §7.4 的验收标准。注意：G2 **无法在 CI 里回归测试**（没有对称 NAT），验收只能在你那两台真机上做，所以时间预算就是验收标准本身。穷举扫完 65535 个端口约需 44 轮（≈分钟级） |
+| ~~Q1~~ VPS 事实 | → 见 A6 | 已答 |
+| ~~Q2~~ 安全姿态 | → 见 A7 | 已答 |
+| ~~Q3~~ 打洞时间预算 | **5 分钟内命中即可；「最终仍走中继」是可接受结果**（中继永远兜底） | 已定（我的决定，见 M6） |
+
+### 9.4 A7（安全降级）的具体后果 —— 必须写清楚
+
+用户选择降级为 rustp2p-quic 默认。这意味着：
+
+| | 降级前（v0.2 iroh） | 降级后（rustp2p-quic 默认） |
+|---|---|---|
+| 身份 | ed25519 公钥指纹，密码学绑定 | `PeerId(pub String)`，**任意字符串、可伪造** |
+| 证书 | 校验（`--ca-file` 信任根） | **跳过校验**（`SkipCertificateVerification`） |
+| `--allow` 白名单 | 密码学意义上的接入控制 | **降为字符串比对**，不是认证 |
+| 加密 | QUIC + TLS | QUIC + TLS（**仍在**，中继不终结流） |
+
+**风险陈述**：能连上 VPS 的第三方，若知道/猜到你的 `PeerId`，即可接入你的 RDP
+会话（明文流量在隧道内，但隧道另一端不再验证身份）。缓解：
+
+1. `PeerId` 用**随机长字符串**（而非可推导的公钥指纹）⇒ 不可猜测；
+2. **仍保留 `--allow`**（虽然不是密码学认证）⇒ 至少挡住误连与扫描；
+3. VPS 的 bootstrap node 建议**只对已知 PeerId 转发**（rustp2p-quic 有
+   `punch_whitelist`），把暴露面从「任何人」缩到「知道 PeerId 的人」；
+4. 文档里明写：**不建议在不可信网络上使用降级模式**，
+   需要认证时用 iroh 后端（`--transport iroh`）。
+
+**这是一个已知的、用户明确接受的回退，不是疏漏。**
 
 ---
 
