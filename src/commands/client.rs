@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+use iroh::Watcher as _;
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::{
@@ -23,6 +24,15 @@ use crate::{
 
 /// 等待远端连接就绪的超时。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 等待本机 net report 就绪的超时。
+///
+/// **这个等待很关键**：打洞时客户端要用 `REACH_OUT` 帧通告自己的公网候选，
+/// 而公网候选（`global_v4`）来自 net report 的 QAD 探测。
+/// net report 要连上 relay、跑完多个中继的对比探测才出结果，
+/// 实测比连接建立晚 24~47 秒 —— 在它就绪之前，客户端通告的候选里
+/// 只有私网地址，服务端**连打洞都不会发起**（连「直连路径已打开」都没有）。
+const NET_REPORT_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// 运行控制端。
 pub async fn run(cfg: ClientConfig) -> Result<()> {
@@ -42,6 +52,23 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
 
     // 把本机 id 也写成纯文本，方便复制到被控端的 --allow。
     let _ = write_endpoint_id_hint(&cfg.key_file, local_id);
+
+    // 先等 net report 就绪，再建连 ——
+    // 详见 [`NET_REPORT_TIMEOUT`] 的说明：候选地址不齐就不该开始打洞。
+    {
+        let mut watcher = endpoint.net_report();
+        match tokio::time::timeout(NET_REPORT_TIMEOUT, watcher.initialized()).await {
+            Ok(_) => {
+                tracing::debug!("net report 已就绪，公网候选可用");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "net report 未在 {} 秒内就绪 —— 客户端通告的公网候选可能为空，打洞会推迟",
+                    NET_REPORT_TIMEOUT.as_secs()
+                );
+            }
+        }
+    }
 
     // 后台立即开始建连（打洞也随之开始），不等到用户打开 mstsc。
     let mgr = ConnManager::start(endpoint.clone(), cfg.remote);
