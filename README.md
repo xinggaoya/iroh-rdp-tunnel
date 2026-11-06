@@ -412,6 +412,40 @@ poll_send{network_path=Ip { remote: [2408:845d:102:6406:...]:56428, local: None 
 > **ADF**（地址依赖，只看源 IP）可以成，**APDF**（地址+端口都依赖）才没戏。
 > 绝大多数家用/办公 NAT 都是 ADF，所以先把防火墙排掉再谈别的。
 
+### 坑 5：net report 还没就绪就建连 ⇒ 客户端通告的候选里没有公网地址
+
+**症状**：两端都正常、连接也建立了，但服务端**连一条 IPv4 打洞包都不发** ——
+连「🔓 公网直连路径已打开」这一行都不会出现。
+
+**原因**：QUIC NAT Traversal 的角色分工是（`noq/connection.rs:857`）：
+
+> **servers** send these addresses to clients in `ADD_ADDRESS` frames …
+> **Clients** provide their own reachable addresses in `REACH_OUT` frames
+> when `initiate_nat_traversal_round()` is called.
+
+也就是说**客户端**要用 `REACH_OUT` 通告自己的可达地址，服务端才知道往哪儿打。
+而客户端的公网候选（`global_v4`）**来自 net report 的 QAD 探测** ——
+net report 要连上 relay、跑完多个中继的对比才出结果，**实测比连接建立晚 24~47 秒**：
+
+```
+06:39:39  已与远端建立连接                                        ← 连接建立
+06:40:03  IPv4 address detected by QAD varies by destination      ← 24 秒后才有公网端点
+```
+
+在它就绪之前，客户端通告的候选里**只有私网地址**，服务端拿到的远端候选
+要么为空、要么是根本打不通的私网地址 —— 于是连尝试都不会有。
+
+**修法**：**两端都在接受/发起连接之前先等 net report 就绪**（`NET_REPORT_TIMEOUT`，默认 25 秒）。
+
+```
+[路径·server] 🔓 公网直连路径已打开  ip:171.37.192.67:36419
+```
+
+出现这行就说明打洞真的开始了。
+
+> 副作用：server / client 启动会慢几秒（要等 QAD 探测跑完）。
+> 对 RDP 隧道完全无影响 —— 反正你也要等 mstsc 连上才能用。
+
 ### 顺带：两个可以忽略的告警
 
 | 告警 | 含义 |

@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use anyhow::Result;
 use iroh::{
     Endpoint, EndpointId, RelayMode,
+    Watcher as _,
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler, Router},
 };
@@ -128,6 +129,14 @@ pub async fn build(cfg: &ServerConfig) -> Result<ServerRuntime> {
 /// 必须套一个超时，否则 banner 永远打不出来。
 pub const RELAY_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// 等待 net report 就绪的超时。
+///
+/// net report 里的公网候选（`global_v4`）是打洞的**前提**：
+/// 服务端要通过 `ADD_ADDRESS` 帧把候选地址发给客户端，客户端才知道往哪儿打。
+/// net report 要连上 relay、跑完多个中继的 QAD 对比才出结果，
+/// 实测比连接建立晚 24~47 秒。
+pub const NET_REPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+
 /// 是否需要等待 relay 连接。
 ///
 /// `RelayMode::Disabled` 下没有 home relay，`Endpoint::online()` 里的
@@ -161,6 +170,24 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
                 println!(
                     " ⚠ {} 秒内未连上 relay —— 客户端可能暂时连不上，但服务已在监听",
                     RELAY_WAIT_TIMEOUT.as_secs()
+                );
+            }
+        }
+    }
+
+    // 等 net report 就绪 —— 它的公网候选（`global_v4`）要通过 `ADD_ADDRESS`
+    // 帧发给客户端，客户端才知道往哪儿打洞。没就绪就接受连接的话，
+    // 客户端拿到的服务端候选为空，打洞必然无果。
+    {
+        let mut watcher = rt.endpoint.net_report();
+        match tokio::time::timeout(NET_REPORT_TIMEOUT, watcher.initialized()).await {
+            Ok(_) => {
+                tracing::debug!("net report 已就绪，公网候选可用");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "net report 未在 {} 秒内就绪 —— 通告出去的公网候选可能为空，打洞会推迟",
+                    NET_REPORT_TIMEOUT.as_secs()
                 );
             }
         }
