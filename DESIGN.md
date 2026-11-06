@@ -76,6 +76,9 @@ server 公布 relay URL（iroh 标准：AddrFilter::relay_only）
 | D7 | **保留 `NO_RELAY` / `FORCE_RELAY` / `FORCE_IPV6` 旧环境变量** | 不破坏用户现有习惯 | 旧的 `FORCE_IPV4_ONLY` 从未真正生效过，一并清理 |
 | D8 | **单一 `irt` 入口，三个子命令** | 只有一个 exe 要分发；子命令让「server / client / diag」在同一套配置层上；`bin/` 退化为薄壳，业务逻辑全部可单测 | 原设计的三个独立二进制（server/client/diag）—— 评审决定合并 |
 | D9 | **用 `presets::Minimal` 自行组装 Endpoint，不用 `presets::N0` + 追加 publisher** | `presets::N0` 内部已注册 `PkarrPublisher::n0_dns()`（默认 `relay_only`），再追加第二个会让**同一 endpoint id 在 pkarr 上出现两条竞态记录**，发布内容不确定 | 沿用现有 `server.rs` 的 `presets::N0` + 第二个 publisher 写法 —— 实施计划阶段核对源码发现的问题 |
+| D10 | **新增 `Discovery` 开关（Public / Disabled）** | 集成测试要能**关掉公共 pkarr / DNS**，否则测试依赖外网、还会把临时 endpoint id 往公共 pkarr 上写；自建 relay 场景同样需要 | 沿用 `presets::N0` 无法关掉发现服务 —— 实施阶段发现的问题 |
+| D11 | **中继 TLS 信任用「传入 CA 配置」而不是「跳过校验」** | `CaTlsConfig::insecure_skip_verify()` 受 iroh-relay 的 `test-utils` feature 门控，**生产构建里根本不存在**；而且「跳过校验」本身是安全陷脚 | 一开始想加 `--insecure-relay` 开关，release 编译失败后改为 `--ca-file <PEM>` —— 正确的做法 |
+| D12 | **路径事件流在 spawn 之前订阅** | 事件流是广播通道，晚订阅会丢掉「中继 → 直连」的迁移事件 —— 而那正是用户最想看到的一行 | 先在任务内部订阅，实测漏掉了迁移 —— 实施阶段发现的问题 |
 
 ---
 
@@ -85,16 +88,17 @@ server 公布 relay URL（iroh 标准：AddrFilter::relay_only）
 src/
 ├── lib.rs           crate 根：pub mod 声明、公共类型再导出
 ├── cli.rs           clap 定义：顶层 Args + 三个子命令 + run() 入口
-├── config.rs        配置层：CLI + 环境变量 → 强类型配置
+├── config.rs        配置层：CLI + 环境变量 → 强类型配置（EnvSource 注入式）
 ├── keys.rs          密钥持久化：load_or_create_secret_key()
 ├── addrpolicy.rs    发布策略：PublishPolicy → AddrFilter 映射
+├── endpoint.rs      iroh 端点组装（server/client 共用）+ CA 文件加载
 ├── nat.rs           NAT 画像：net_report 解析 → NatProfile + 判定
 ├── portmap.rs       端口映射探测：UPnP / NAT-PMP / PCP 可用性
 ├── pathinfo.rs      路径可观测：PathKind / describe_path / spawn_path_monitor
 ├── tunnel.rs        隧道核心：TCP ↔ QUIC stream 双向桥接（两端共用）
 ├── connmgr.rs       client 侧常驻连接管理器（自动重连）
-├── fw.rs            Windows 防火墙规则安装/卸载
-├── diag.rs          网络体检报告组装与渲染
+├── fw.rs            Windows 防火墙规则安装/卸载/检测
+├── diag.rs          网络体检报告组装与渲染（文本 + JSON）
 ├── commands/        子命令实现（纯逻辑，可被单测直接调用）
 │   ├── mod.rs
 │   ├── server.rs    被控端
@@ -113,8 +117,9 @@ bin/irt.rs  ──►  cli ──► commands/{server,client,diag}
                                 │                │
                                 │                └──► nat ──► portmap
                                 │
+                                ├──► endpoint ──► addrpolicy
                                 ├──► tunnel ◄──── connmgr
-                                └──► pathinfo / fw
+                                └──► pathinfo / fw / diag
 ```
 
 `lib.rs` 只做聚合与再导出，不含逻辑。**任何模块不得反向依赖 `bin/`**；
@@ -325,6 +330,35 @@ pub fn has_allow_rule(exe: &Path, rule_name: &str) -> bool;
 
 非 Windows 平台返回「不适用」错误，不 panic。
 
+### 5.9 `endpoint.rs`
+
+```rust
+/// 地址发布 / 解析方式。
+pub enum Discovery { Public, Disabled }
+
+/// 中继连接的 TLS 信任。
+/// —— 用「传入 CA 配置」而不是「跳过校验」：
+///    iroh-relay 的 insecure_skip_verify() 受 test-utils feature 门控，
+///    生产构建里不存在；而且跳过校验本身是安全陷脚。
+pub struct EndpointOptions {
+    pub secret_key: Option<SecretKey>,
+    pub relay_mode: RelayMode,
+    pub publish: PublishPolicy,
+    pub discovery: Discovery,
+    pub portmapper: bool,
+    pub ca_tls_config: Option<CaTlsConfig>,
+}
+
+/// 按选项绑定一个 iroh 端点（server 用；含 pkarr 发布 + DNS 解析）。
+pub async fn bind(opts: EndpointOptions) -> Result<Endpoint>;
+
+/// 只解析、不发布（client 用；控制端不需要被拨通）。
+pub async fn bind_resolver_only(opts: EndpointOptions) -> Result<Endpoint>;
+
+/// 从 PEM 文件读取额外的根证书（信任自签证书的自建 relay）。
+pub fn load_ca_file(path: &Path) -> Result<CaTlsConfig>;
+```
+
 ---
 
 ## 6. CLI 契约
@@ -332,11 +366,14 @@ pub fn has_allow_rule(exe: &Path, rule_name: &str) -> bool;
 单一 `irt` 可执行文件，三个子命令：
 
 ```
-irt server [--publish relay|ip|all] [--key-file PATH] [--rdp ADDR]
+irt server [--publish relay|ip|ipv6|all] [--key-file PATH] [--rdp ADDR]
             [--no-relay] [--relay URL]... [--allow ID]...
+            [--no-discovery] [--ca-file PATH]
             [--install-firewall-rule] [--uninstall-firewall-rule]
 
 irt client <ENDPOINT_ID> [--listen ADDR] [--no-relay] [--relay URL]...
+                  [--no-discovery] [--ca-file PATH]
+                  [--install-firewall-rule] [--uninstall-firewall-rule]
 
 irt diag [--json]
 ```
@@ -348,65 +385,93 @@ irt diag [--json]
 
 ## 7. 运行时输出样例
 
-### 7.1 server 启动
+### 7.1 server 启动（实机输出）
 
 ```
 =========================================================
- iroh-rdp-tunnel SERVER  (build v0.2.0)
+ iroh-rdp-tunnel SERVER  (v0.2.0)
 =========================================================
- endpoint id   : 86e9c0158a1f097baf3b17ce917501f5e4e3c244cf9cf57f39dcb187e9e09440
- 密钥文件      : C:\Users\10322\AppData\Roaming\iroh-rdp-tunnel\server.key
- 发布策略      : relay-only   (经中继建连后双方同时打洞，自动迁移直连)
- home relay    : https://aps1-1.relay.n0.iroh.link./
- 本机公网端点  : 171.37.192.67:34622   (EIM 映射 · 端点稳定)
+ endpoint id   : 1c46b334278b7ba001fed57d9000192b6994c198599fcfb14dc320054cfe9922
+ 密钥文件      : C:\Users\<你>\AppData\Roaming\iroh-rdp-tunnel\server.key
+ 发布策略      : relay
+                 → 只公布 relay URL：客户端经 relay 建连后，
+                   双方同时发包打洞，成功后自动迁移到直连
  RDP 目标      : 127.0.0.1:3389
  防火墙        : ⚠ 未检测到入站 UDP 放行规则
                 → 请以管理员执行:  irt server --install-firewall-rule
+                 （规则名: iroh-rdp-tunnel (irt UDP inbound)）
+ 接入白名单    : （未启用，任何 endpoint id 均可接入）
+ 中继          : https://aps1-1.relay.n0.iroh.link./
+ 本机公网端点  : 171.37.192.67:35839
+
  等待客户端连接…  (Ctrl-C 退出)
 ```
 
-### 7.2 client 连接（关键验收信号）
+### 7.2 client 连接（关键验收信号，实机输出）
 
 ```
 =========================================================
- iroh-rdp-tunnel CLIENT  (build v0.2.0)
+ iroh-rdp-tunnel CLIENT  (v0.2.0)
 =========================================================
- 远端 endpoint : 86e9c015…09440
+ 远端 endpoint : 1c46b334…9922
  本地 TCP 监听 : 127.0.0.1:13389
 
  正在与远端建立连接…
-   [路径] 中继 https://aps1-1.relay.n0.iroh.link./  RTT 41ms
-   [路径] ✅ 已切换到直连  171.37.192.67:34622  RTT 37ms
- =========================================================
- 打开 mstsc 连接: 127.0.0.1:13389
+
+ 用系统自带的远程桌面连接本机端口:
+     Windows : mstsc /v:127.0.0.1:13389
+     Mac     : Microsoft Remote Desktop → 地址填 127.0.0.1:13389
+     手机    : RD Client → 地址填 127.0.0.1:13389
+ (Ctrl-C 退出)
+
+ [路径·client] 中继  https://aps1-1.relay.n0.iroh.link./  RTT 1026ms
+ [路径·client] ✅ 已切换到直连  171.37.192.67:35839  RTT 37ms
 ```
 
-### 7.3 `diag`
+被控端同步输出：
+
+```
+ [路径·server] 中继  https://aps1-1.relay.n0.iroh.link./  RTT 622ms
+ [路径·server] ✅ 已切换到直连  171.37.192.67:35839  RTT 1ms
+```
+
+### 7.3 `diag`（实机输出）
 
 ```
 =========================================================
  iroh-rdp-tunnel 网络体检
 =========================================================
- 公网 IPv4 端点   : 171.37.192.67:34622
+ 公网 IPv4 端点   : 171.37.192.67:35284
+ 公网 IPv6 端点   : （无全局地址）
  NAT 映射行为     : 端点无关映射 (EIM)  ✅ 公网端点稳定，可通告
  NAT 过滤行为     : 未测量（iroh 无法直接探测；严格验证见 netdiag/filter-proof.js）
- UDP 可用         : IPv4 ✅   IPv6 ❌（无全局地址）
+                   → 但这不阻断直连：iroh 的打洞走「双方同时发包」
+ UDP 可用         : IPv4 ✅   IPv6 ❌
  端口映射         : UPnP ❌  NAT-PMP ❌  PCP ❌（不支持）
                    → 不影响：EIM 映射下内端口固定即端点稳定，打洞不依赖端口映射
- 最近中继         : aps1-1.relay.n0.iroh.link.  41ms
-                   （未选中 aps1-1 时说明探测未完成，可加 --relay 手动指定）
+
+ 实际 home relay : https://euc1-1.relay.n0.iroh.link./
+ 探测最快中继     : https://euc1-1.relay.n0.iroh.link./
+                     https://euc1-1.relay.n0.iroh.link./  241ms
+                     https://use1-1.relay.n0.iroh.link./  247ms
+                     https://usw1-1.relay.n0.iroh.link./  432ms
+                   （探测有 5 秒总超时，未列出的中继不代表不可达）
 
  判定: ✅ 具备 P2P 直连条件
-   · 映射为 EIM ⇒ 通告的公网端点稳定，对端能对上号
-   · iroh 的打洞走「双方同时发包」，不需要 NAT 放行任意来源入站
-   · 你的「地址依赖过滤」不会阻断打洞
-   · 无 UPnP 不影响（仅损失「首包更快」的机会）
+   · 映射为 EIM（端点无关映射）⇒ 公网端点稳定，对端能对上号
+   · iroh 的打洞走「双方同时发包」，不需要 NAT 放行任意来源的入站 UDP ⇒ 地址依赖过滤不阻断直连
+   · UPnP / NAT-PMP / PCP 均不支持 ⇒ 不影响打洞（EIM 下内端口固定即端点稳定），仅损失「首包更快」的机会
  建议:
    1. server 保持默认 --publish relay
-   2. 管理员执行 irt server --install-firewall-rule
+   2. 管理员执行 irt server --install-firewall-rule 放行入站 UDP
    3. 连接后看 client 输出是否出现「✅ 已切换到直连」
 =========================================================
 ```
+
+> 注：本机从中国到 n0 公共 relay 的延迟在 180–250ms（欧洲节点），
+> 而直连国内是 37ms —— **这就是「必须打洞成功」的原因**。
+> `aps1-1`（亚太）偶尔会被选中（约 190ms），但从本机看它连接不稳定。
+
 
 ---
 

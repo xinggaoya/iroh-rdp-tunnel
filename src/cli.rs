@@ -289,35 +289,47 @@ pub async fn run() -> anyhow::Result<()> {
     match &args.command {
         Command::Server(a) => {
             let cfg = resolve_server(a, &env)?;
-            if a.install_firewall_rule {
-                return install_firewall_rule();
-            }
-            if a.uninstall_firewall_rule {
-                return uninstall_firewall_rule();
+            if handle_firewall(a.install_firewall_rule, a.uninstall_firewall_rule)? {
+                return Ok(());
             }
             commands::server::run(cfg).await
         }
-        Command::Client(a) => commands::client::run(resolve_client(a, &env)?).await,
+        Command::Client(a) => {
+            let cfg = resolve_client(a, &env)?;
+            if handle_firewall(a.install_firewall_rule, a.uninstall_firewall_rule)? {
+                return Ok(());
+            }
+            commands::client::run(cfg).await
+        }
         Command::Diag(a) => commands::diag::run(a.clone()).await,
     }
 }
 
-/// 添加入站 UDP 防火墙放行规则。
-fn install_firewall_rule() -> anyhow::Result<()> {
-    let exe = crate::fw::current_exe()?;
-    crate::fw::install_udp_allow_rule(&exe, crate::fw::RULE_NAME)?;
-    println!("✅ 已添加入站 UDP 放行规则");
-    println!("   规则名: {}", crate::fw::RULE_NAME);
-    println!("   程序  : {}", exe.display());
-    Ok(())
-}
-
-/// 删除入站 UDP 防火墙放行规则。
-fn uninstall_firewall_rule() -> anyhow::Result<()> {
-    crate::fw::remove_rule(crate::fw::RULE_NAME)?;
-    println!("✅ 已删除入站 UDP 放行规则");
-    println!("   规则名: {}", crate::fw::RULE_NAME);
-    Ok(())
+/// 处理防火墙规则的安装 / 卸载。
+///
+/// 返回 `true` 表示已经处理完，调用方应当直接退出。
+///
+/// server 与 client 是同一个可执行文件，打洞时两端都要能收到入站 UDP，
+/// 所以两个子命令都支持这两个开关。
+pub fn handle_firewall(install: bool, uninstall: bool) -> anyhow::Result<bool> {
+    if install && uninstall {
+        anyhow::bail!("--install-firewall-rule 与 --uninstall-firewall-rule 不能同时使用");
+    }
+    if install {
+        let exe = crate::fw::current_exe()?;
+        crate::fw::install_udp_allow_rule(&exe, crate::fw::RULE_NAME)?;
+        println!("✅ 已添加入站 UDP 放行规则");
+        println!("   规则名: {}", crate::fw::RULE_NAME);
+        println!("   程序  : {}", exe.display());
+        return Ok(true);
+    }
+    if uninstall {
+        crate::fw::remove_rule(crate::fw::RULE_NAME)?;
+        println!("✅ 已删除入站 UDP 放行规则");
+        println!("   规则名: {}", crate::fw::RULE_NAME);
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -513,6 +525,17 @@ Wf86aX6PepsntZv2GYlA5UpabfT2EZICICpJ5h/iI+i341gBmLiAFQOyTDT+/wQc
         };
         let cfg = resolve_client(&args, &env(&[("IRT_LISTEN", "127.0.0.1:23389")])).unwrap();
         assert_eq!(cfg.listen.to_string(), "127.0.0.1:23389");
+    }
+
+    #[test]
+    fn install_and_uninstall_firewall_rule_are_mutually_exclusive() {
+        let err = handle_firewall(true, true).unwrap_err().to_string();
+        assert!(err.contains("不能同时使用"), "实际: {err}");
+    }
+
+    #[test]
+    fn handle_firewall_is_a_noop_when_no_flag_is_given() {
+        assert!(!handle_firewall(false, false).unwrap());
     }
 
     #[test]
