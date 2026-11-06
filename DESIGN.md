@@ -82,6 +82,11 @@ server 公布 relay URL（iroh 标准：AddrFilter::relay_only）
 | D13 | **endpoint id 解析前统一转小写** | iroh 的十六进制解码器只认小写（HEXLOWER），但用户复制来的 id 很可能带大写字母 —— Review Focus 明确点名了这一项 | 直接交给 iroh 解析，大写 id 会报「不是合法的 endpoint id」 |
 | D14 | **防火墙检测按**路径**匹配，不解析 netsh 的标签名** | netsh 输出是**本地化**的（中文 Windows 上是「程序:」），而且非 verbose 模式根本没有程序路径行；路径本身不本地化 | 解析标签名（初版做法）→ 在中文 Windows 上 100% 误报 |
 | D15 | **防火墙检测查**全部**规则，而不是只查我们自己的规则名** | Windows 会为监听端口的程序自动创建一条以 exe 文件名命名的入站 UDP 放行规则 —— 那条同样有效 | 只查 `RULE_NAME` → 明明已经放行了却一直提示「未检测到」 |
+| D16 | **两端都在建连前先等 net report 就绪** | 打洞时**客户端**用 `REACH_OUT` 通告自己的可达地址（`noq/connection.rs:857`），而公网候选 `global_v4` 来自 net report 的 QAD 探测 —— net report 未就绪时通告出去的候选只有私网地址，服务端**连尝试都不会发起** | 连接建立即开始打洞 → 实测跨网始终不出现「直连路径已打开」，服务端一个公网包都不发 |
+| D17 | **client banner 也要显示防火墙状态** | 打洞要**双向**：服务端往控制端公网映射端口发的包要穿过**控制端**的 Windows 防火墙。只给被控端装规则是常见疏漏 | client banner 不显示防火墙状态 → 两边看起来都正常，直连就是不成 |
+| D18 | **中继一致性检测 + 打印可复制的客户端命令** | 两端各自自动选 relay 极易选到不同家，流量多一跳中继转发，RTT 从 ~400ms 涨到 1200ms | 只靠文字提醒用户「两端要加同一个 `--relay`」→ 实测连续三次被忽略；改为 server 直接打印带 relay 的完整命令 |
+| D19 | **路径事件只报公网端点** | 本机多张虚拟网卡（192.168.0/52/104、172.29.x）会让路径事件刷屏，把真正的公网端点淹没 | 打印所有直连路径事件 → 一屏噪音，关键信息看不见 |
+| D20 | **中继不一致告警改为周期检查** | 路径事件发生的瞬间本端往往还没连上 relay（home relay 为空），判不出来 → 告警被静默漏掉 | 只在事件驱动时判定 → 告警从不出现，用户以为没问题 |
 
 ---
 
@@ -96,8 +101,10 @@ src/
 ├── addrpolicy.rs    发布策略：PublishPolicy → AddrFilter 映射
 ├── endpoint.rs      iroh 端点组装（server/client 共用）+ CA 文件加载
 ├── nat.rs           NAT 画像：net_report 解析 → NatProfile + 判定
+├── netaddr.rs       公网地址判定（RFC 6890，替代尚未稳定的 is_global()）
 ├── portmap.rs       端口映射探测：UPnP / NAT-PMP / PCP 可用性
 ├── pathinfo.rs      路径可观测：PathKind / describe_path / spawn_path_monitor
+├── lookup.rs        查对端在 n0 上公布的地址（diag --lookup）
 ├── tunnel.rs        隧道核心：TCP ↔ QUIC stream 双向桥接（两端共用）
 ├── connmgr.rs       client 侧常驻连接管理器（自动重连）
 ├── fw.rs            Windows 防火墙规则安装/卸载/检测
