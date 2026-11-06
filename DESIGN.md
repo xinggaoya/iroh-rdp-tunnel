@@ -87,6 +87,12 @@ server 公布 relay URL（iroh 标准：AddrFilter::relay_only）
 | D18 | **中继一致性检测 + 打印可复制的客户端命令** | 两端各自自动选 relay 极易选到不同家，流量多一跳中继转发，RTT 从 ~400ms 涨到 1200ms | 只靠文字提醒用户「两端要加同一个 `--relay`」→ 实测连续三次被忽略；改为 server 直接打印带 relay 的完整命令 |
 | D19 | **路径事件只报公网端点** | 本机多张虚拟网卡（192.168.0/52/104、172.29.x）会让路径事件刷屏，把真正的公网端点淹没 | 打印所有直连路径事件 → 一屏噪音，关键信息看不见 |
 | D20 | **中继不一致告警改为周期检查** | 路径事件发生的瞬间本端往往还没连上 relay（home relay 为空），判不出来 → 告警被静默漏掉 | 只在事件驱动时判定 → 告警从不出现，用户以为没问题 |
+| D21 | **传输层抽象：统一到「开一条字节流」，不抽象「连接」对象** | 两个后端的连接模型完全不同：iroh 是一条 QUIC 连接上开多条流；rustp2p 是**流即连接**（`open_bi` 直接给流，没有独立连接句柄）。抽象「连接」会逼出一堆适配代码 | 抽象到「`open_stream` / `accept_stream`」这一层就够用 —— RDP 隧道只关心字节流，上层一行都不用改 |
+| D22 | **rustp2p 的字节流适配用「后台任务 + channel」** | rustp2p-quic 的 `ReliableSendStream`/`ReliableRecvStream` 只暴露 async 便捷方法（`write_all`/`read`/`finish`），**没有 poll 级 API**，底层 quinn 流字段也是私有的；而 Tokio 的 `AsyncRead`/`AsyncWrite` 是 poll 级的 | 后台任务持有流，channel 通信；背压靠有界 channel + `try_send` 实现 |
+| D23 | **`poll_write` 必须严格遵守「Pending ⇒ 数据未被接受」** | `send().await` 的 future 一旦被 poll 就可能把数据放进队列；此时返回 `Pending`，上层（tokio 的 `copy`）以为「什么都没写」，会带着一份**更长的 buf** 重试 ⇒ 旧数据被重复发送 | 改用 `try_send` + 本地待发缓冲 `pending_data`；送出后**立即返回 `Ok(len)`** 记账 |
+| D24 | **rustp2p 的 `open_bi` 必须自己加超时** | rustp2p 的 `open_bi` 在路由未建立时**一直等**（不是超时返回）。一次调用就永远挂着，重试逻辑形同虚设 | 单次尝试 30 秒超时 + 重试（重试会重新触发路由查找，中继路由确认有时序要求），总预算 5 分钟 |
+| D25 | **两端必须用同一个「公网可达」的 bootstrap 地址** | 中继靠**观测两端从哪个地址来**来推断可达端点。被控端若用 `127.0.0.1` 连本机的节点，中继观测到的就是回环地址 ⇒ 客户端永远打不到 | 被控端也必须用公网地址连 bootstrap |
+| D26 | **默认仍是 `--transport iroh`（保底）** | rustp2p 的中继是**协议层转发**（`QuicRelay` 包携带不透明 QUIC 密文），QUIC 流的建立仍需已确认的路由 ⇒ **打洞成功前 rustp2p 连不上**（实测打洞可达 4 分钟） | 想「先保证可用」就用 iroh（永远能连，只是慢）；想「争取直连」才切 rustp2p |
 
 ---
 
