@@ -11,7 +11,10 @@ use std::{
 
 use iroh::{EndpointId, RelayMode};
 
-use crate::addrpolicy::PublishPolicy;
+use crate::{
+    addrpolicy::PublishPolicy,
+    endpoint::{Discovery, TlsTrust},
+};
 
 /// 被控端配置。
 #[derive(Debug, Clone)]
@@ -26,6 +29,10 @@ pub struct ServerConfig {
     pub relay_mode: RelayMode,
     /// 允许接入的 endpoint id 白名单；空表示不限制。
     pub allow_list: Vec<EndpointId>,
+    /// 是否启用 n0 公共 pkarr / DNS。
+    pub discovery: Discovery,
+    /// 中继连接的 TLS 信任模式。
+    pub tls_trust: TlsTrust,
 }
 
 /// 控制端配置。
@@ -37,6 +44,10 @@ pub struct ClientConfig {
     pub listen: SocketAddr,
     /// 中继模式。
     pub relay_mode: RelayMode,
+    /// 是否启用 n0 公共 DNS 解析。
+    pub discovery: Discovery,
+    /// 中继连接的 TLS 信任模式。
+    pub tls_trust: TlsTrust,
 }
 
 /// 注入式环境变量来源。

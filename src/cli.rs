@@ -13,6 +13,7 @@ use crate::{
     addrpolicy::PublishPolicy,
     commands,
     config::{ClientConfig, EnvSource, ServerConfig},
+    endpoint::{Discovery, TlsTrust},
 };
 
 /// 顶层命令。
@@ -65,6 +66,14 @@ pub struct ServerArgs {
     /// 允许接入的 endpoint id 白名单，可重复指定。
     #[arg(long = "allow", value_name = "ID")]
     pub allow: Vec<String>,
+
+    /// 不使用 n0 公共 pkarr / DNS（自建 relay、离线环境）。
+    #[arg(long)]
+    pub no_discovery: bool,
+
+    /// 跳过中继的 TLS 证书校验（自建 relay 用自签证书时）。
+    #[arg(long)]
+    pub insecure_relay: bool,
 }
 
 /// `irt client` 的参数。
@@ -85,6 +94,14 @@ pub struct ClientArgs {
     /// 完全禁用 relay。
     #[arg(long)]
     pub no_relay: bool,
+
+    /// 不使用 n0 公共 DNS（已知对端地址时使用）。
+    #[arg(long)]
+    pub no_discovery: bool,
+
+    /// 跳过中继的 TLS 证书校验（自建 relay 用自签证书时）。
+    #[arg(long)]
+    pub insecure_relay: bool,
 }
 
 /// `irt diag` 的参数。
@@ -114,6 +131,8 @@ pub fn resolve_server(args: &ServerArgs, env: &EnvSource) -> anyhow::Result<Serv
 
     let relay_mode = resolve_relay_mode(args.no_relay, &args.relay, env)?;
     let allow_list = resolve_allow_list(args, env)?;
+    let discovery = resolve_discovery(args.no_discovery, env);
+    let tls_trust = resolve_tls_trust(args.insecure_relay, env);
 
     Ok(ServerConfig {
         key_file,
@@ -121,6 +140,8 @@ pub fn resolve_server(args: &ServerArgs, env: &EnvSource) -> anyhow::Result<Serv
         publish,
         relay_mode,
         allow_list,
+        discovery,
+        tls_trust,
     })
 }
 
@@ -140,10 +161,14 @@ pub fn resolve_client(args: &ClientArgs, env: &EnvSource) -> anyhow::Result<Clie
         .parse()
         .with_context(|| format!("无法解析监听地址 `{listen}`"))?;
     let relay_mode = resolve_relay_mode(args.no_relay, &args.relay, env)?;
+    let discovery = resolve_discovery(args.no_discovery, env);
+    let tls_trust = resolve_tls_trust(args.insecure_relay, env);
     Ok(ClientConfig {
         remote,
         listen,
         relay_mode,
+        discovery,
+        tls_trust,
     })
 }
 
@@ -204,6 +229,24 @@ fn resolve_allow_list(args: &ServerArgs, env: &EnvSource) -> anyhow::Result<Vec<
                 .with_context(|| format!("不是合法的 endpoint id `{s}`"))
         })
         .collect()
+}
+
+/// 地址发现：CLI `--no-discovery` / `IRT_NO_DISCOVERY` > 公共 pkarr + DNS。
+fn resolve_discovery(no_discovery: bool, env: &EnvSource) -> Discovery {
+    if no_discovery || env.get("IRT_NO_DISCOVERY").is_some() {
+        Discovery::Disabled
+    } else {
+        Discovery::Public
+    }
+}
+
+/// TLS 信任：CLI `--insecure-relay` / `IRT_INSECURE_RELAY` > 系统根证书。
+fn resolve_tls_trust(insecure: bool, env: &EnvSource) -> TlsTrust {
+    if insecure || env.get("IRT_INSECURE_RELAY").is_some() {
+        TlsTrust::InsecureSkipVerify
+    } else {
+        TlsTrust::System
+    }
 }
 
 /// 初始化日志。
@@ -407,5 +450,59 @@ mod tests {
         };
         let cfg = resolve_client(&args, &env(&[("IRT_LISTEN", "127.0.0.1:23389")])).unwrap();
         assert_eq!(cfg.listen.to_string(), "127.0.0.1:23389");
+    }
+
+    #[test]
+    fn discovery_defaults_to_public() {
+        let cfg = resolve_server(&ServerArgs::default(), &env(&[])).unwrap();
+        assert_eq!(cfg.discovery, Discovery::Public);
+        let args = ClientArgs {
+            remote: "86e9c0158a1f097baf3b17ce917501f5e4e3c244cf9cf57f39dcb187e9e09440".into(),
+            ..Default::default()
+        };
+        let cfg = resolve_client(&args, &env(&[])).unwrap();
+        assert_eq!(cfg.discovery, Discovery::Public);
+    }
+
+    #[test]
+    fn no_discovery_env_disables_public_lookup() {
+        let cfg = resolve_server(&ServerArgs::default(), &env(&[("IRT_NO_DISCOVERY", "1")])).unwrap();
+        assert_eq!(cfg.discovery, Discovery::Disabled);
+    }
+
+    #[test]
+    fn tls_trust_defaults_to_system_roots() {
+        let cfg = resolve_server(&ServerArgs::default(), &env(&[])).unwrap();
+        assert_eq!(cfg.tls_trust, TlsTrust::System);
+    }
+
+    #[test]
+    fn insecure_relay_cli_enables_skip_verify() {
+        let args = ServerArgs {
+            insecure_relay: true,
+            ..Default::default()
+        };
+        let cfg = resolve_server(&args, &env(&[])).unwrap();
+        assert_eq!(cfg.tls_trust, TlsTrust::InsecureSkipVerify);
+    }
+
+    #[test]
+    fn insecure_relay_env_enables_skip_verify() {
+        let cfg = resolve_server(
+            &ServerArgs::default(),
+            &env(&[("IRT_INSECURE_RELAY", "1")]),
+        )
+        .unwrap();
+        assert_eq!(cfg.tls_trust, TlsTrust::InsecureSkipVerify);
+    }
+
+    #[test]
+    fn no_discovery_cli_overrides_env() {
+        let args = ServerArgs {
+            no_discovery: true,
+            ..Default::default()
+        };
+        let cfg = resolve_server(&args, &env(&[])).unwrap();
+        assert_eq!(cfg.discovery, Discovery::Disabled);
     }
 }

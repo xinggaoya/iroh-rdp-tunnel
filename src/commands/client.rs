@@ -9,13 +9,14 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use iroh::{Endpoint, address_lookup::DnsAddressLookup, endpoint::presets};
+
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::{
-    ALPN, BUILD_TAG,
+    BUILD_TAG,
     config::ClientConfig,
     connmgr::ConnManager,
+    endpoint::{EndpointOptions, bind_resolver_only},
     tunnel::bridge_tcp_to_quic,
 };
 
@@ -24,13 +25,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 运行控制端。
 pub async fn run(cfg: ClientConfig) -> Result<()> {
-    let endpoint = Endpoint::builder(presets::Minimal)
-        .relay_mode(cfg.relay_mode.clone())
-        .alpns(vec![ALPN.to_vec()])
-        // 客户端不需要被拨通，因此不发布自己的地址；只需要能**解析**远端。
-        .address_lookup(DnsAddressLookup::n0_dns())
-        .bind()
-        .await?;
+    let endpoint = bind_resolver_only(EndpointOptions {
+        secret_key: None,
+        relay_mode: cfg.relay_mode.clone(),
+        publish: crate::addrpolicy::PublishPolicy::RelayOnly,
+        discovery: cfg.discovery,
+        portmapper: true,
+        tls_trust: cfg.tls_trust,
+    })
+    .await?;
 
     // 后台立即开始建连（打洞也随之开始），不等到用户打开 mstsc。
     let mgr = ConnManager::start(endpoint, cfg.remote);

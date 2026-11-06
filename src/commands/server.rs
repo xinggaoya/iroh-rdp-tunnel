@@ -10,8 +10,7 @@ use std::net::SocketAddr;
 use anyhow::Result;
 use iroh::{
     Endpoint, EndpointId,
-    address_lookup::{DnsAddressLookup, PkarrPublisher},
-    endpoint::{Connection, PortmapperConfig, presets},
+    endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use tokio::net::TcpStream;
@@ -19,6 +18,7 @@ use tokio::net::TcpStream;
 use crate::{
     ALPN, BUILD_TAG,
     config::ServerConfig,
+    endpoint::{EndpointOptions, bind},
     keys::{load_or_create_secret_key, write_endpoint_id_hint},
     tunnel::bridge_quic_to_tcp,
 };
@@ -96,19 +96,15 @@ pub async fn build(cfg: &ServerConfig) -> Result<ServerRuntime> {
     let secret_key = load_or_create_secret_key(&cfg.key_file)?;
     let endpoint_id = secret_key.public();
 
-    let endpoint = Endpoint::builder(presets::Minimal)
-        .secret_key(secret_key)
-        .relay_mode(cfg.relay_mode.clone())
-        .alpns(vec![ALPN.to_vec()])
-        // 尝试 UPnP / NAT-PMP / PCP 做端口映射；路由器不支持时自动跳过，不影响打洞。
-        .portmapper_config(PortmapperConfig::default())
-        // 只发布一个 publisher —— 若在 presets::N0 之外再追加一个，
-        // 同一个 endpoint id 会在 pkarr 上出现两条竞态记录，发布内容不确定。
-        .address_lookup(PkarrPublisher::n0_dns().addr_filter(cfg.publish.to_addr_filter()))
-        // DNS 解析侧：客户端靠它把 endpoint id 解析成 relay URL / IP。
-        .address_lookup(DnsAddressLookup::n0_dns())
-        .bind()
-        .await?;
+    let endpoint = bind(EndpointOptions {
+        secret_key: Some(secret_key),
+        relay_mode: cfg.relay_mode.clone(),
+        publish: cfg.publish,
+        discovery: cfg.discovery,
+        portmapper: true,
+        tls_trust: cfg.tls_trust,
+    })
+    .await?;
 
     tracing::debug!("endpoint {endpoint_id} 已绑定");
 
