@@ -43,6 +43,8 @@ pub struct BridgeHandler {
     pub rdp_target: SocketAddr,
     /// 允许接入的 endpoint id 白名单；空表示不限制。
     pub allow_list: Vec<EndpointId>,
+    /// 本机端点 —— 用于读取 home relay（检测两端中继是否一致）。
+    pub endpoint: Endpoint,
 }
 
 impl ProtocolHandler for BridgeHandler {
@@ -59,7 +61,7 @@ impl ProtocolHandler for BridgeHandler {
         }
 
         tracing::info!("收到来自 {remote} 的连接");
-        spawn_path_reporter(conn.clone(), "server");
+        spawn_path_reporter(conn.clone(), "server", self.endpoint.clone());
 
         loop {
             let (mut send, recv) = match conn.accept_bi().await {
@@ -114,6 +116,7 @@ pub async fn build(cfg: &ServerConfig) -> Result<ServerRuntime> {
         handler: BridgeHandler {
             rdp_target: cfg.rdp_target,
             allow_list: cfg.allow_list.clone(),
+            endpoint: endpoint.clone(),
         },
         endpoint,
     })

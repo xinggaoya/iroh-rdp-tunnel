@@ -68,6 +68,20 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
     println!(" (Ctrl-C 退出)");
     println!();
 
+    // 打印本端实际连上的中继 —— **两端必须一致**。
+    // 各自自动选 relay 很容易选到不同家，流量就得先到本端的中继再转给对端的中继，
+    // 多一跳，延迟直接叠加（实测见过 1152ms）。
+    {
+        let endpoint = endpoint.clone();
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(30), endpoint.online()).await;
+            if let Some(url) = crate::pathinfo::home_relay(&endpoint) {
+                println!(" 本端中继      : {url}");
+                println!("                 （与被控端的中继**保持一致**可避免中继间转发）");
+            }
+        });
+    }
+
     // Ctrl-C 时优雅关闭端点（否则 iroh 会报
     // "Endpoint dropped without calling close()"）。
     tokio::select! {

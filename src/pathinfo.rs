@@ -12,7 +12,7 @@
 use std::time::Duration;
 
 use futures::StreamExt;
-use iroh::{TransportAddr, endpoint::Connection, endpoint::PathEvent};
+use iroh::{Endpoint, TransportAddr, endpoint::Connection, endpoint::PathEvent};
 use std::sync::{Arc, Mutex};
 
 use crate::netaddr::{is_global_v4, is_global_v6};
@@ -32,6 +32,38 @@ pub fn is_public_endpoint(addr: &TransportAddr) -> bool {
         },
         _ => false,
     }
+}
+
+/// 读取端点当前连上的 home relay（没连上则返回 None）。
+pub fn home_relay(endpoint: &Endpoint) -> Option<String> {
+    use iroh::Watcher as _;
+    endpoint
+        .home_relay_status()
+        .get()
+        .into_iter()
+        .find(|s| s.is_connected())
+        .map(|s| s.url().to_string())
+}
+
+/// 判断「路径实际用的中继」与「本端 home relay」是否不一致。
+///
+/// 两端各自自动选 relay 时经常选到不同���家 —— 流量就得先到本端的中继、
+/// 再由它转发到对端的中继（多一跳），延迟直接叠加。
+/// 实测见过：服务端 euc1-1（欧洲）、客户端 usw1-1（美西），
+/// 路径 RTT 被拉到 1152ms。
+pub fn relay_mismatch(path_relay: &str, home_relay: Option<&str>) -> bool {
+    match home_relay {
+        Some(home) => normalize_relay(home) != normalize_relay(path_relay),
+        None => false,
+    }
+}
+
+/// 归一化 relay URL（去掉末尾的 `.` 与 `/`）。
+///
+/// `RelayUrl` 的规范形式是 `https://host./`（带 DNS 根尾点），
+/// 而路径事件里的字符串可能是 `https://host./` 也可能少一个尾点 —— 不归一化就会误判。
+pub fn normalize_relay(url: &str) -> String {
+    url.trim_end_matches(['.', '/']).to_string()
 }
 
 /// 路径类型。
@@ -162,6 +194,27 @@ pub fn transition_label(prev: Option<PathKind>, now: PathKind) -> &'static str {
     }
 }
 
+/// 若路径用的中继与本端 home relay 不一致，打印告警。
+///
+/// 两端各自自动选 relay 时经常选到不同家 —— 流量要先到本端的中继，
+/// 再由它转发到对端的中继（多一跳），延迟直接叠加。
+fn warn_relay_mismatch(endpoint: &Endpoint, tag: &str, info: &PathInfo) {
+    if info.kind != PathKind::Relay {
+        return;
+    }
+    let home = home_relay(endpoint);
+    if relay_mismatch(&info.remote, home.as_deref()) {
+        println!(
+            " [路径·{tag}] ⚠ 路径经由 {} 中转，但本端连的是 {} —— 多了一跳中继转发",
+            info.remote,
+            home.as_deref().unwrap_or("?")
+        );
+        println!(
+            " [路径·{tag}]   ↳ 两端用**同一个** relay 可省掉这一跳：--relay https://aps1-1.relay.n0.iroh.link./"
+        );
+    }
+}
+
 /// 启动一个路径报告器，把路径变化打印到标准输出。
 ///
 /// `tag` 用来区分是 server 侧还是 client 侧打印的。
@@ -175,7 +228,11 @@ pub fn transition_label(prev: Option<PathKind>, now: PathKind) -> &'static str {
 ///
 /// **不只打印被选中的路径** —— 直连路径「被打开又关闭」是打洞失败最直接的证据，
 /// 只看选中路径的话会得到一片空白，无法区分「没尝试打洞」和「打了但没通」。
-pub fn spawn_path_reporter(conn: Connection, tag: &str) -> tokio::task::JoinHandle<()> {
+pub fn spawn_path_reporter(
+    conn: Connection,
+    tag: &str,
+    endpoint: Endpoint,
+) -> tokio::task::JoinHandle<()> {
     let tag = tag.to_string();
     let tag_events = tag.clone();
     let last = Arc::new(std::sync::Mutex::new(None::<(PathKind, String)>));
@@ -186,7 +243,8 @@ pub fn spawn_path_reporter(conn: Connection, tag: &str) -> tokio::task::JoinHand
     let saw_direct2 = Arc::clone(&saw_direct);
     let handle = tokio::spawn(async move {
         if let Some(info) = describe_path(&conn) {
-            report(&last2, &tag_events, info);
+            report(&last2, &tag_events, &info);
+            warn_relay_mismatch(&endpoint, &tag_events, &info);
         }
         while let Some(event) = events.next().await {
             match event {
@@ -202,7 +260,8 @@ pub fn spawn_path_reporter(conn: Connection, tag: &str) -> tokio::task::JoinHand
                         if info.kind == PathKind::Direct {
                             saw_direct2.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
-                        report(&last2, &tag_events, info);
+                        report(&last2, &tag_events, &info);
+                        warn_relay_mismatch(&endpoint, &tag_events, &info);
                     }
                 }
                 PathEvent::Closed { remote_addr, .. } => {
@@ -229,8 +288,11 @@ pub fn spawn_path_reporter(conn: Connection, tag: &str) -> tokio::task::JoinHand
                 DIRECT_WAIT_WINDOW.as_secs()
             );
             println!(
-                " [路径·{tag2}]   ↳ 常见原因：对端 NAT 映射随目标变化（非 EIM），\
-                 公布出去的公网端点对不上号"
+                " [路径·{tag2}]   ↳ 排查 1：两端是否用了**同一个** relay？（对比两端启动时的中继地址）"
+            );
+            println!(
+                " [路径·{tag2}]   ↳ 排查 2：对端 NAT 映射随目标变化（非 EIM）\
+                 → 对端需做端口映射或换网络"
             );
         }
     });
@@ -239,7 +301,7 @@ pub fn spawn_path_reporter(conn: Connection, tag: &str) -> tokio::task::JoinHand
 }
 
 /// 打印一次路径变化（去重：同一路径 + 同一地址不重复打印）。
-fn report(last: &Mutex<Option<(PathKind, String)>>, tag: &str, info: PathInfo) {
+fn report(last: &Mutex<Option<(PathKind, String)>>, tag: &str, info: &PathInfo) {
     let mut prev = last.lock().unwrap();
     let key = (info.kind, info.remote.clone());
     if *prev == Some(key.clone()) {
@@ -357,5 +419,35 @@ mod tests {
         assert!(!is_public_endpoint(&private));
         assert!(!is_public_endpoint(&link_local));
         assert!(!is_public_endpoint(&relay));
+    }
+
+    #[test]
+    fn relay_mismatch_detects_different_relays() {
+        // 实测踩过的坑：服务端 euc1-1（欧洲）、客户端 usw1-1（美西），
+        // 路径 RTT 被拉到 1152ms。
+        assert!(relay_mismatch(
+            "https://euc1-1.relay.n0.iroh.link./",
+            Some("https://usw1-1.relay.n0.iroh.link./")
+        ));
+    }
+
+    #[test]
+    fn relay_mismatch_ignores_trailing_slash() {
+        assert!(!relay_mismatch(
+            "https://aps1-1.relay.n0.iroh.link./",
+            Some("https://aps1-1.relay.n0.iroh.link")
+        ));
+        assert!(!relay_mismatch(
+            "https://aps1-1.relay.n0.iroh.link./",
+            Some("https://aps1-1.relay.n0.iroh.link./")
+        ));
+    }
+
+    #[test]
+    fn relay_mismatch_is_silent_without_home_relay() {
+        assert!(!relay_mismatch(
+            "https://euc1-1.relay.n0.iroh.link./",
+            None
+        ));
     }
 }

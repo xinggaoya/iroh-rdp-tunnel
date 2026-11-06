@@ -1,6 +1,6 @@
 [package]
 name = "iroh-rdp-tunnel"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Minimal P2P tunnel for Windows RDP (port 3389) built on iroh"
 license = "MIT OR Apache-2.0"

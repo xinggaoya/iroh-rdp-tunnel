@@ -114,7 +114,7 @@ async fn connection_loop(
             Ok(conn) => {
                 let connected_at = Instant::now();
                 tracing::info!("已与远端 {remote} 建立连接");
-                spawn_path_reporter(conn.clone(), "client");
+                spawn_path_reporter(conn.clone(), "client", endpoint.clone());
                 let _ = tx.send(Some(conn.clone()));
                 // 等连接关闭（对端断开或传输出错）后再重连。
                 let _ = conn.closed().await;
