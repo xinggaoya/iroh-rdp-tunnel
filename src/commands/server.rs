@@ -21,7 +21,6 @@ use crate::{
         TransportEndpoint, TransportKind,
         iroh::IrohTransport,
         rustp2p::{Rustp2pOptions, Rustp2pTransport},
-        spawn_path_reporter,
     },
     tunnel::bridge_stream_to_tcp,
 };
@@ -155,7 +154,7 @@ async fn run_rustp2p(cfg: ServerConfig) -> Result<()> {
         punch_whitelist: None,
         allow_list: cfg.allow_peers.clone(),
     };
-    let transport = Rustp2pTransport::build(&opts, vec![]).await?;
+    let transport = Rustp2pTransport::build(&opts, vec![], "server").await?;
 
     println!();
     println!("=========================================================");
@@ -190,7 +189,6 @@ async fn run_rustp2p(cfg: ServerConfig) -> Result<()> {
         let transport = transport.clone();
         async move { serve(transport, cfg.rdp_target).await }
     });
-    spawn_path_reporter(transport.as_ref(), "server");
 
     println!(" 等待客户端连接…  (Ctrl-C 退出)");
     println!();

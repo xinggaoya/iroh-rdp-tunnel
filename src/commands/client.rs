@@ -23,7 +23,6 @@ use crate::{
         PeerRef, TransportEndpoint, TransportKind,
         iroh::IrohTransport,
         rustp2p::{Rustp2pOptions, Rustp2pTransport},
-        spawn_path_reporter,
     },
     tunnel::bridge_tcp_to_stream,
 };
@@ -80,6 +79,7 @@ async fn run_rustp2p(cfg: ClientConfig) -> Result<()> {
     let transport = Rustp2pTransport::build(
         &opts,
         vec![rustp2p_quic::PeerId::new(peer_id.clone())],
+        "client",
     )
     .await?;
 
@@ -112,9 +112,6 @@ async fn run_rustp2p(cfg: ClientConfig) -> Result<()> {
     println!("     Windows : mstsc /v:{}", cfg.listen);
     println!(" (Ctrl-C 退出)");
     println!();
-
-    // 路径可观测：直连 / 中继的迁移。
-    spawn_path_reporter(transport.as_ref(), "client");
 
     tokio::select! {
         r = serve_local(transport.clone(), PeerRef::Rustp2p(peer_id), listener) => r,

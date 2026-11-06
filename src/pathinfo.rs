@@ -13,9 +13,12 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use iroh::{Endpoint, TransportAddr, endpoint::Connection, endpoint::PathEvent};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use crate::netaddr::{is_global_v4, is_global_v6};
+use crate::{
+    netaddr::{is_global_v4, is_global_v6},
+    transport::{TransportEndpoint, TransportEvent},
+};
 
 /// 直连观察窗口：连接建立后多久还没出现直连路径，就提示当前走中继。
 pub const DIRECT_WAIT_WINDOW: Duration = Duration::from_secs(30);
@@ -242,136 +245,119 @@ fn check_relay_mismatch_once(
     }
 }
 
-/// 启动一个路径报告器，把路径变化打印到标准输出。
+/// 启动一个**传输层**路径报告器，把路径变化打印到标准输出。
+///
+/// 订阅的是 [`TransportEvent`]，所以**两个后端共用这一个实现** ——
+/// iroh 从 `Connection::path_events()` 转事件，rustp2p 从轮询 `link_mode()` 转事件。
+///
+/// 事件源是 **endpoint 级**的（不是每连接一个），所以一条连接断开
+/// 不会让输出重复或错乱。
 ///
 /// `tag` 用来区分是 server 侧还是 client 侧打印的。
 ///
 /// 输出形如：
 /// ```text
 ///  [路径·client] 中继  https://aps1-1.relay.n0.iroh.link./  RTT 41ms
-///  [路径·client] 🔓 直连路径已打开  171.37.192.67:34622
+///  [路径·client] 🔓 公网直连路径已打开  171.37.192.67:34622
 ///  [路径·client] ✅ 已切换到直连  171.37.192.67:34622  RTT 37ms
 /// ```
-///
-/// **不只打印被选中的路径** —— 直连路径「被打开又关闭」是打洞失败最直接的证据，
-/// 只看选中路径的话会得到一片空白，无法区分「没尝试打洞」和「打了但没通」。
-pub fn spawn_path_reporter(
-    conn: Connection,
+pub fn spawn_transport_reporter(
+    transport: &dyn TransportEndpoint,
     tag: &str,
+) -> tokio::task::JoinHandle<()> {
+    let mut events = transport.subscribe();
+    let tag = tag.to_string();
+    tokio::spawn(async move {
+        // 记录上一次的状态，用来判断「切换到直连」还是「回落到中继」。
+        let mut last: Option<(PathKind, String)> = None;
+        while let Ok(event) = events.recv().await {
+            match event {
+                TransportEvent::PathOpened { remote } => {
+                    // 只关心**公网**直连端点：私网地址的开关是虚拟网卡造成的噪音。
+                    // （iroh 适配器在推送前就已经过滤过）
+                    println!(" [路径·{tag}] 🔓 公网直连路径已打开  {remote}");
+                }
+                TransportEvent::PathSelected { kind, remote, rtt } => {
+                    let key = (kind, remote.clone());
+                    if last.as_ref() == Some(&key) {
+                        // 同一路径、同一地址：RTT 的日常波动不刷屏。
+                        continue;
+                    }
+                    let prev_kind = last.as_ref().map(|(k, _)| *k);
+                    let prefix = transition_label(prev_kind, kind);
+                    last = Some(key);
+                    let rtt = match rtt {
+                        Some(rtt) => format!("  RTT {}ms", rtt.as_millis()),
+                        None => String::new(),
+                    };
+                    println!(" [路径·{tag}] {prefix}  {remote}{rtt}");
+                }
+                TransportEvent::PathClosed { remote } => {
+                    println!(" [路径·{tag}] ❌ 公网直连路径已关闭  {remote}");
+                }
+            }
+        }
+    })
+}
+
+/// 启动**每连接**的中继一致性检查。
+///
+/// iroh 特有：rustp2p 的中继是自建 bootstrap，没有「home relay」这个概念，
+/// 所以这个检查只在 iroh 适配器里用。
+pub fn spawn_relay_consistency_check(
+    conn: Connection,
     endpoint: Endpoint,
+    tag: &str,
 ) -> tokio::task::JoinHandle<()> {
     let tag = tag.to_string();
-    let tag_events = tag.clone();
-    let last = Arc::new(std::sync::Mutex::new(None::<(PathKind, String)>));
-    let last2 = Arc::clone(&last);
-    // 先把**当前**路径打一遍，避免错过订阅前的迁移。
-    let mut events = conn.path_events();
-    let saw_direct = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let saw_direct2 = Arc::clone(&saw_direct);
     // 中继不一致只报一次，事件驱动与周期检查共用这个标志。
     let relay_reported = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let relay_reported2 = Arc::clone(&relay_reported);
-    // 事件循环与周期检查都要用 conn / endpoint，这里先备一份克隆。
-    let conn_for_check = conn.clone();
-    let endpoint_for_check = endpoint.clone();
-    let handle = tokio::spawn(async move {
-        if let Some(info) = describe_path(&conn) {
-            report(&last2, &tag_events, &info);
-            check_relay_mismatch_once(&endpoint, &tag_events, &conn, &relay_reported2);
-        }
-        while let Some(event) = events.next().await {
-            match event {
-                PathEvent::Opened { remote_addr, .. } => {
-                    // 只关心**公网**直连端点：私网地址的开关是虚拟网卡造成的噪音。
-                    if is_public_endpoint(&remote_addr) {
-                        saw_direct2.store(true, std::sync::atomic::Ordering::Relaxed);
-                        println!(" [路径·{tag_events}] 🔓 公网直连路径已打开  {remote_addr}");
-                    }
-                }
-                PathEvent::Selected { .. } => {
-                    if let Some(info) = describe_path(&conn) {
-                        if info.kind == PathKind::Direct {
-                            saw_direct2.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        report(&last2, &tag_events, &info);
-                        check_relay_mismatch_once(&endpoint, &tag_events, &conn, &relay_reported2);
-                    }
-                }
-                PathEvent::Closed { remote_addr, .. } => {
-                    if is_public_endpoint(&remote_addr) {
-                        println!(" [路径·{tag_events}] ❌ 公网直连路径已关闭  {remote_addr}");
-                    } else if !remote_addr.is_ip() {
-                        println!(" [路径·{tag_events}] ⚠ 中继路径已关闭  {remote_addr}");
-                    }
-                }
-                // PathEvent 是 #[non_exhaustive]，未来新增变体时静默忽略。
-                _ => {}
-            }
-        }
-    });
-
-    // 观察窗口：连接建立后一段时间还没直连，就明确告知「当前走中继」。
-    // 否则用户只能看到「中继」两个字，不知道是还没打洞成功还是压根打不了。
     let tag2 = tag.clone();
     tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(RELAY_CHECK_INTERVAL).await;
+            if check_relay_mismatch_once(&endpoint, &tag2, &conn, &relay_reported2) {
+                // 已经报过警，停止周期检查。
+                return;
+            }
+        }
+    })
+}
+
+/// 启动「直连观察窗口」提醒。
+///
+/// 连接建立后一段时间还没直连，就明确告知「当前走中继」——
+/// 否则用户只能看到「中继」两个字，不知道是还没打洞成功还是压根打不了。
+pub fn spawn_direct_wait_notice(tag: &str) -> tokio::task::JoinHandle<()> {
+    let tag = tag.to_string();
+    let saw_direct = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saw_direct2 = Arc::clone(&saw_direct);
+    tokio::spawn(async move {
         tokio::time::sleep(DIRECT_WAIT_WINDOW).await;
-        if !saw_direct.load(std::sync::atomic::Ordering::Relaxed) {
+        if !saw_direct2.load(std::sync::atomic::Ordering::Relaxed) {
             println!(
-                " [路径·{tag2}] ⚠ {} 秒内未建立**公网**直连路径，当前走中继（RDP 可用，延迟偏高）",
+                " [路径·{tag}] ⚠ {} 秒内未建立**公网**直连路径，当前走中继（RDP 可用，延迟偏高）",
                 DIRECT_WAIT_WINDOW.as_secs()
             );
             println!(
-                " [路径·{tag2}]   ↳ 排查 1：**对端**的 Windows 防火墙是否放行了入站 UDP？\
+                " [路径·{tag}]   ↳ 排查 1：**对端**的 Windows 防火墙是否放行了入站 UDP？\
                  （打洞要双向；在对端执行 irt client --install-firewall-rule）"
             );
             println!(
-                " [路径·{tag2}]   ↳ 排查 2：两端是否用了**同一个** relay？（对比两端启动时的中继地址）"
+                " [路径·{tag}]   ↳ 排查 2：两端是否用了**同一个** relay？（对比两端启动时的中继地址）"
             );
             println!(
-                " [路径·{tag2}]   ↳ 排查 3：对端 NAT 映射随目标变化（非 EIM）\
+                " [路径·{tag}]   ↳ 排查 3：对端 NAT 映射随目标变化（非 EIM）\
                  → 对端需做端口映射或换网络"
             );
         }
-    });
-
-    // 周期检查中继一致性。
-    //
-    // 路径事件发生的瞬间本端可能还没连上 relay（home relay 为空），判不出来；
-    // 只靠事件驱动会漏报。这里每隔几秒补查一次，报过就不再重复。
-    {
-        let conn = conn_for_check;
-        let endpoint = endpoint_for_check;
-        let tag3 = tag.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(RELAY_CHECK_INTERVAL).await;
-                if check_relay_mismatch_once(&endpoint, &tag3, &conn, &relay_reported) {
-                    // 已经报过警，停止周期检查。
-                    return;
-                }
-            }
-        });
-    }
-
-    handle
+    })
 }
 
-/// 打印一次路径变化（去重：同一路径 + 同一地址不重复打印）。
-fn report(last: &Mutex<Option<(PathKind, String)>>, tag: &str, info: &PathInfo) {
-    let mut prev = last.lock().unwrap();
-    let key = (info.kind, info.remote.clone());
-    if *prev == Some(key.clone()) {
-        // 同一路径、同一地址：RTT 的日常波动不刷屏。
-        return;
-    }
-    let prev_kind = prev.as_ref().map(|(k, _)| *k);
-    let prefix = transition_label(prev_kind, info.kind).to_string();
-    *prev = Some(key);
-    let rtt = match info.rtt {
-        Some(rtt) => format!("  RTT {}ms", rtt.as_millis()),
-        None => String::new(),
-    };
-    println!(" [路径·{tag}] {prefix}  {}{rtt}", info.remote);
+/// 标记「已经看到过公网直连路径」—— 让直连观察窗口不再误报。
+pub fn mark_direct_seen(flag: &std::sync::atomic::AtomicBool) {
+    flag.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(test)]

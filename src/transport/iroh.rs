@@ -28,7 +28,10 @@ use tokio::sync::{broadcast, mpsc};
 use crate::{
     ALPN,
     connmgr::ConnManager,
-    pathinfo::{describe_path, spawn_path_monitor, spawn_path_reporter},
+    pathinfo::{
+        describe_path, is_public_endpoint, spawn_direct_wait_notice, spawn_relay_consistency_check,
+        spawn_transport_reporter,
+    },
     transport::{
         AcceptedStream, AsyncStream, PathState, PeerRef, TransportEndpoint, TransportEvent,
         TransportKind,
@@ -83,14 +86,18 @@ impl IrohTransport {
             .accept(ALPN, collector)
             .spawn();
 
-        Arc::new(Self {
+        let transport = Arc::new(Self {
             endpoint,
             router: Some(router),
             events,
             state,
             incoming: Arc::new(tokio::sync::Mutex::new(rx)),
             conn_mgr: None,
-        })
+        });
+
+        // 路径状态报告是 **endpoint 级**的 —— 一条连接断开不会让输出重复。
+        spawn_transport_reporter(transport.as_ref(), "server");
+        transport
     }
 
     /// 组装 **client 侧**的传输端点。
@@ -115,6 +122,7 @@ impl IrohTransport {
         });
 
         transport.spawn_path_publisher();
+        spawn_transport_reporter(transport.as_ref(), "client");
         transport
     }
 
@@ -182,16 +190,53 @@ impl ProtocolHandler for StreamCollector {
 
         tracing::info!("收到来自 {remote} 的连接");
 
-        // v0.2 的路径报告器：输出格式与时机完全沿用。
-        spawn_path_reporter(conn.clone(), "server", self.endpoint.clone());
+        // iroh 特有的两件事：中继一致性检查 + 直连观察窗口。
+        // 路径状态本身由传输层的事件流统一报告（endpoint 级）。
+        spawn_relay_consistency_check(conn.clone(), self.endpoint.clone(), "server");
+        spawn_direct_wait_notice("server");
 
-        // 额外把路径状态推到广播通道。
+        // 把路径状态推到广播通道，供上层消费。
         let events = self.events.clone();
         let state = self.state.clone();
-        spawn_path_monitor(conn.clone(), move |info| {
-            let next = PathState::from_path_info(&info);
-            *state.lock().unwrap() = next.clone();
-            let _ = events.send(crate::transport::to_event(&next));
+        let mut path_events = conn.path_events();
+        let saw_direct = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_direct2 = std::sync::Arc::clone(&saw_direct);
+        let conn_for_events = conn.clone();
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            while let Some(event) = path_events.next().await {
+                match event {
+                    iroh::endpoint::PathEvent::Opened { remote_addr, .. } => {
+                        // 只关心**公网**直连端点：私网地址的开关是虚拟网卡造成的噪音。
+                        if is_public_endpoint(&remote_addr) {
+                            saw_direct2.store(true, std::sync::atomic::Ordering::Relaxed);
+                            let _ = events.send(TransportEvent::PathOpened {
+                                remote: remote_addr.to_string(),
+                            });
+                        }
+                    }
+                    iroh::endpoint::PathEvent::Closed { remote_addr, .. } => {
+                        if is_public_endpoint(&remote_addr) {
+                            let _ = events.send(TransportEvent::PathClosed {
+                                remote: remote_addr.to_string(),
+                            });
+                        }
+                    }
+                    iroh::endpoint::PathEvent::Selected { .. } => {
+                        let Some(info) = describe_path(&conn_for_events) else {
+                            continue;
+                        };
+                        if info.kind == crate::pathinfo::PathKind::Direct {
+                            saw_direct2.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        let next = PathState::from_path_info(&info);
+                        *state.lock().unwrap() = next.clone();
+                        let _ = events.send(crate::transport::to_event(&next));
+                    }
+                    // PathEvent 是 #[non_exhaustive]，未来新增变体时静默忽略。
+                    _ => {}
+                }
+            }
         });
 
         loop {

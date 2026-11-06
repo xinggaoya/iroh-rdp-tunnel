@@ -40,6 +40,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::{
+    pathinfo::spawn_transport_reporter,
     transport::{
         AcceptedStream, AsyncStream, PathState, PeerRef, TransportEndpoint, TransportEvent,
         TransportKind,
@@ -132,6 +133,7 @@ impl Rustp2pTransport {
     pub async fn build(
         opts: &Rustp2pOptions,
         watched: Vec<PeerId>,
+        tag: &str,
     ) -> Result<Arc<Self>> {
         let identity = Identity::new(opts.peer_id.clone(), &opts.seed)
             .map_err(|e| anyhow::anyhow!("创建 rustp2p 身份失败: {e}"))?;
@@ -169,6 +171,9 @@ impl Rustp2pTransport {
 
         transport.spawn_accept_loop(tx, opts.allow_list.clone());
         transport.spawn_path_poller();
+        // 路径报告由适配器内部统一负责（iroh 适配器也是这么做的），
+        // 调用方不需要、也不应该再起一份。
+        spawn_transport_reporter(transport.as_ref(), tag);
         Ok(transport)
     }
 

@@ -252,47 +252,6 @@ pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Unpin {}
 
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncStream for T {}
 
-/// 订阅传输层的路径事件并打印 —— **两个后端通用**。
-///
-/// 输出格式与 v0.2 的 `pathinfo::spawn_path_reporter` 保持一致：
-///
-/// ```text
-///  [路径·client] 中继  https://aps1-1.relay.n0.iroh.link./  RTT 41ms
-///  [路径·client] ✅ 已切换到直连  171.37.192.67:34622  RTT 37ms
-/// ```
-///
-/// iroh 后端继续用 `pathinfo` 里那个更详细的报告器（它还���「公网直连路径已打开」
-/// 与「中继不一致」告警）；这个是给 rustp2p 这类**只有轮询接口**的后端用的。
-pub fn spawn_path_reporter(
-    transport: &dyn TransportEndpoint,
-    tag: &str,
-) -> tokio::task::JoinHandle<()> {
-    let mut events = transport.subscribe();
-    let tag = tag.to_string();
-    tokio::spawn(async move {
-        // 记录上一次的状态，用来判断「切换到直连」还是「回落到中继」。
-        let mut last: Option<(PathKind, String)> = None;
-        while let Ok(event) = events.recv().await {
-            let TransportEvent::PathSelected { kind, remote, rtt } = event else {
-                continue;
-            };
-            let key = (kind, remote.clone());
-            if last.as_ref() == Some(&key) {
-                // 同一路径、同一地址：RTT 的日常波动不刷屏。
-                continue;
-            }
-            let prev_kind = last.as_ref().map(|(k, _)| *k);
-            let prefix = crate::pathinfo::transition_label(prev_kind, kind);
-            last = Some(key);
-            let rtt = match rtt {
-                Some(rtt) => format!("  RTT {}ms", rtt.as_millis()),
-                None => String::new(),
-            };
-            println!(" [路径·{tag}] {prefix}  {remote}{rtt}");
-        }
-    })
-}
-
 /// 一条入站流及其来源。
 pub struct AcceptedStream {
     /// 对端标识。
