@@ -15,8 +15,24 @@ use futures::StreamExt;
 use iroh::{TransportAddr, endpoint::Connection, endpoint::PathEvent};
 use std::sync::{Arc, Mutex};
 
+use crate::netaddr::{is_global_v4, is_global_v6};
+
 /// 直连观察窗口：连接建立后多久还没出现直连路径，就提示当前走中继。
 pub const DIRECT_WAIT_WINDOW: Duration = Duration::from_secs(30);
+
+/// 判断一个传输地址是否是**公网**端点（而非私网 / 回环 / 链路本地）。
+///
+/// 路径事件里会同时冒出本机各张虚拟网卡的私网地址，那些开关纯属噪音；
+/// 打洞真正关心的是公网端点。
+pub fn is_public_endpoint(addr: &TransportAddr) -> bool {
+    match addr {
+        TransportAddr::Ip(sa) => match sa {
+            std::net::SocketAddr::V4(v4) => is_global_v4(v4.ip()),
+            std::net::SocketAddr::V6(v6) => is_global_v6(v6.ip()),
+        },
+        _ => false,
+    }
+}
 
 /// 路径类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,10 +191,10 @@ pub fn spawn_path_reporter(conn: Connection, tag: &str) -> tokio::task::JoinHand
         while let Some(event) = events.next().await {
             match event {
                 PathEvent::Opened { remote_addr, .. } => {
-                    // relay 路径必然打开，打出来只会刷屏；直连路径才是打洞的信号。
-                    if remote_addr.is_ip() {
+                    // 只关心**公网**直连端点：私网地址的开关是虚拟网卡造成的噪音。
+                    if is_public_endpoint(&remote_addr) {
                         saw_direct2.store(true, std::sync::atomic::Ordering::Relaxed);
-                        println!(" [路径·{tag_events}] 🔓 直连路径已打开  {remote_addr}");
+                        println!(" [路径·{tag_events}] 🔓 公网直连路径已打开  {remote_addr}");
                     }
                 }
                 PathEvent::Selected { .. } => {
@@ -190,9 +206,9 @@ pub fn spawn_path_reporter(conn: Connection, tag: &str) -> tokio::task::JoinHand
                     }
                 }
                 PathEvent::Closed { remote_addr, .. } => {
-                    if remote_addr.is_ip() {
-                        println!(" [路径·{tag_events}] ❌ 直连路径已关闭  {remote_addr}");
-                    } else {
+                    if is_public_endpoint(&remote_addr) {
+                        println!(" [路径·{tag_events}] ❌ 公网直连路径已关闭  {remote_addr}");
+                    } else if !remote_addr.is_ip() {
                         println!(" [路径·{tag_events}] ⚠ 中继路径已关闭  {remote_addr}");
                     }
                 }
@@ -209,7 +225,7 @@ pub fn spawn_path_reporter(conn: Connection, tag: &str) -> tokio::task::JoinHand
         tokio::time::sleep(DIRECT_WAIT_WINDOW).await;
         if !saw_direct.load(std::sync::atomic::Ordering::Relaxed) {
             println!(
-                " [路径·{tag2}] ⚠ {} 秒内未建立直连路径，当前走中继（RDP 可用，延迟偏高）",
+                " [路径·{tag2}] ⚠ {} 秒内未建立**公网**直连路径，当前走中继（RDP 可用，延迟偏高）",
                 DIRECT_WAIT_WINDOW.as_secs()
             );
             println!(
@@ -329,5 +345,17 @@ mod tests {
             transition_label(Some(PathKind::Direct), PathKind::Direct),
             "直连"
         );
+    }
+
+    #[test]
+    fn public_endpoint_detection_filters_private_addresses() {
+        let public = TransportAddr::Ip("171.37.192.67:34622".parse().unwrap());
+        let private = TransportAddr::Ip("192.168.0.138:34622".parse().unwrap());
+        let link_local = TransportAddr::Ip("[fe80::1]:34622".parse().unwrap());
+        let relay = TransportAddr::Relay("https://aps1-1.relay.n0.iroh.link./".parse().unwrap());
+        assert!(is_public_endpoint(&public));
+        assert!(!is_public_endpoint(&private));
+        assert!(!is_public_endpoint(&link_local));
+        assert!(!is_public_endpoint(&relay));
     }
 }

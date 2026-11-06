@@ -57,7 +57,9 @@ impl PublishPolicy {
                         .filter(|a| match a {
                             TransportAddr::Ip(sa) => match sa {
                                 std::net::SocketAddr::V4(_) => false,
-                                std::net::SocketAddr::V6(sa6) => is_global_ipv6(sa6.ip()),
+                                std::net::SocketAddr::V6(sa6) => {
+                                    crate::netaddr::is_global_v6(sa6.ip())
+                                }
                             },
                             _ => false,
                         })
@@ -68,11 +70,6 @@ impl PublishPolicy {
             Self::All => AddrFilter::unfiltered(),
         }
     }
-}
-
-/// 是否为可对外公布的全局 IPv6 地址（排除未指定、回环、链路本地）。
-fn is_global_ipv6(ip: &std::net::Ipv6Addr) -> bool {
-    !ip.is_unspecified() && !ip.is_loopback() && !ip.is_unicast_link_local()
 }
 
 #[cfg(test)]

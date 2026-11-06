@@ -14,6 +14,7 @@ pub mod fw;
 pub mod keys;
 pub mod lookup;
 pub mod nat;
+pub mod netaddr;
 pub mod pathinfo;
 pub mod portmap;
 pub mod tunnel;
