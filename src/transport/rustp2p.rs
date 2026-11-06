@@ -190,6 +190,11 @@ impl Rustp2pTransport {
         self.endpoint.local_addr()
     }
 
+    /// 当前的 NAT 观测结果。
+    pub fn nat_info(&self) -> rustp2p_quic::NatInfo {
+        self.endpoint.nat_info()
+    }
+
     /// 已知的 peer 列表。
     pub fn known_peers(&self) -> Vec<PeerId> {
         self.endpoint

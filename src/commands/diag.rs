@@ -11,11 +11,13 @@ use iroh::{RelayMode, Watcher as _};
 use crate::{
     addrpolicy::PublishPolicy,
     cli::{DiagArgs, parse_endpoint_id},
+    config::DEFAULT_STUN_SERVERS,
     diag::{DiagReport, render, render_json},
     endpoint::{Discovery, EndpointOptions, bind},
     lookup,
-    nat::{profile_from_report, verdict},
+    nat::{profile_from_report, profile_from_rustp2p, verdict},
     portmap::{self, PortMappingStatus},
+    transport::{TransportEndpoint, TransportKind, rustp2p::Rustp2pOptions},
 };
 
 /// 采集网络报告的超时。
@@ -35,6 +37,15 @@ pub async fn run(args: DiagArgs) -> Result<()> {
     // `--lookup` 是另一种模式：查**对端**公布了什么，而不是体检本机网络。
     if let Some(raw) = args.lookup.as_deref() {
         return run_lookup(raw, args.json).await;
+    }
+
+    // 两个后端的 NAT 观测口径不同，结论也不同 —— 分派。
+    let transport = match args.transport.as_deref() {
+        Some(v) => TransportKind::parse(v)?,
+        None => TransportKind::Iroh,
+    };
+    if transport == TransportKind::Rustp2p {
+        return run_rustp2p(&args).await;
     }
 
     // 端口映射探测与 net report 互不依赖，并行跑。
@@ -101,6 +112,68 @@ pub async fn run(args: DiagArgs) -> Result<()> {
 
     // 优雅关闭，否则 iroh 会报 "Endpoint dropped without calling close()"。
     endpoint.close().await;
+    Ok(())
+}
+
+/// rustp2p 后端的网络体检。
+///
+/// 与 iroh 路径的区别：NAT 观测来自 rustp2p 自己的 STUN 探测，
+/// 而且它会给出**端口分配范围** —— 这个数字直接决定「端口穷举」的可行性，
+/// 是判断「对称 NAT 能不能破」的关键。
+async fn run_rustp2p(args: &DiagArgs) -> Result<()> {
+    // 端口映射探测与 NAT 观测互不依赖，并行跑。
+    let pm_task = tokio::spawn(portmap::probe());
+
+    let mut stun_servers = args.stun.clone();
+    if stun_servers.is_empty() {
+        stun_servers = DEFAULT_STUN_SERVERS.iter().map(|s| s.to_string()).collect();
+    }
+
+    // 体检用的端点不需要对端，也不需要 bootstrap —— 只做本机 NAT 观测。
+    let transport = crate::transport::rustp2p::Rustp2pTransport::build(
+        &Rustp2pOptions {
+            peer_id: "irt-diag".to_string(),
+            seed: b"irt-diag-seed".to_vec(),
+            bind: "0.0.0.0:0".parse().expect("固定地址可解析"),
+            bootstrap: Vec::new(),
+            stun_servers,
+            max_assistant_sockets: args.assistant_sockets.unwrap_or(4),
+            punch_whitelist: None,
+            allow_list: Vec::new(),
+        },
+        vec![],
+        "diag",
+    )
+    .await?;
+
+    // 等 NAT 观测出结果 —— STUN 至少要成功一次才有意义。
+    let deadline = std::time::Instant::now() + REPORT_TIMEOUT;
+    let mut info = transport.nat_info();
+    while std::time::Instant::now() < deadline {
+        info = transport.nat_info();
+        if !info.public_ips.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let pm = match tokio::time::timeout(PORTMAP_TIMEOUT, pm_task).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => PortMappingStatus::ProbeFailed(format!("探测任务异常结束: {e}")),
+        Err(_) => PortMappingStatus::ProbeFailed("探测超时".to_string()),
+    };
+
+    let profile = profile_from_rustp2p(&info, pm);
+    let verdict = verdict(&profile);
+    let report = DiagReport { profile, verdict };
+
+    if args.json {
+        println!("{}", render_json(&report));
+    } else {
+        print!("{}", render(&report));
+    }
+
+    transport.close().await;
     Ok(())
 }
 

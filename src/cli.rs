@@ -219,6 +219,21 @@ pub struct DiagArgs {
     /// 客户端会被困在直连上，NAT 过滤会让它必然超时。
     #[arg(long, value_name = "ENDPOINT_ID")]
     pub lookup: Option<String>,
+
+    /// 用哪个后端做体检：iroh | rustp2p（默认 iroh）。
+    ///
+    /// 两个后端的 NAT 观测口径不同，**结论也不同**：
+    /// 同一个对称 NAT，iroh 判「直连无望」，rustp2p 判「可破」。
+    #[arg(long, value_name = "KIND")]
+    pub transport: Option<String>,
+
+    /// rustp2p 体检用的 STUN 服务器，可重复指定（默认三个国内公共 STUN）。
+    #[arg(long, value_name = "ADDR")]
+    pub stun: Vec<String>,
+
+    /// rustp2p 体检时的辅助 socket 数（默认 4）。
+    #[arg(long, value_name = "N")]
+    pub assistant_sockets: Option<usize>,
 }
 
 /// 解析 `irt server` 的配置。
