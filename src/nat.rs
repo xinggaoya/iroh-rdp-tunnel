@@ -86,7 +86,7 @@ pub fn profile_from_report(report: &NetReport, pm: PortMappingStatus) -> NatProf
             None => relay_latencies.push((url.clone(), latency)),
         }
     }
-    relay_latencies.sort_by(|a, b| a.1.cmp(&b.1));
+    relay_latencies.sort_by_key(|a| a.1);
 
     NatProfile {
         global_v4: report.global_v4,

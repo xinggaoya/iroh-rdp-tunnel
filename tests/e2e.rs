@@ -80,7 +80,7 @@ async fn start_server(
         .expect("被控端未能在超时内连上 relay");
     let id = rt.endpoint.id();
     let endpoint = rt.endpoint.clone();
-    let router = Router::builder(endpoint).accept(ALPN.to_vec(), rt.handler.clone()).spawn();
+    let router = Router::builder(endpoint).accept(ALPN, rt.handler.clone()).spawn();
     let addr = EndpointAddr {
         id,
         addrs: BTreeSet::from([TransportAddr::Relay(relay_url)]),

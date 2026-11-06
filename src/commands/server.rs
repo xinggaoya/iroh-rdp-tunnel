@@ -128,7 +128,7 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
     let _ = write_endpoint_id_hint(&cfg.key_file, endpoint_id);
 
     let router = Router::builder(rt.endpoint.clone())
-        .accept(ALPN.to_vec(), rt.handler.clone())
+        .accept(ALPN, rt.handler.clone())
         .spawn();
 
     // 等 relay 连上、DNS 公告发出，addr 才是完整的。

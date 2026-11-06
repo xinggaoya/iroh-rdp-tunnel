@@ -87,9 +87,7 @@ pub fn status(exe: &Path) -> FirewallStatus {
 pub fn status_hint(status: FirewallStatus) -> String {
     match status {
         FirewallStatus::Allowed => "✅ 已放行入站 UDP".to_string(),
-        FirewallStatus::Missing => format!(
-            "⚠ 未检测到入站 UDP 放行规则\n                → 请以管理员执行:  irt server --install-firewall-rule"
-        ),
+        FirewallStatus::Missing => "⚠ 未检测到入站 UDP 放行规则\n                → 请以管理员执行:  irt server --install-firewall-rule".to_string(),
         FirewallStatus::Unknown => {
             "？无法检测防火墙规则状态（可能没有读取权限）".to_string()
         }

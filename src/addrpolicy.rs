@@ -57,7 +57,7 @@ impl PublishPolicy {
                         .filter(|a| match a {
                             TransportAddr::Ip(sa) => match sa {
                                 std::net::SocketAddr::V4(_) => false,
-                                std::net::SocketAddr::V6(sa6) => is_global_ipv6(&sa6.ip()),
+                                std::net::SocketAddr::V6(sa6) => is_global_ipv6(sa6.ip()),
                             },
                             _ => false,
                         })

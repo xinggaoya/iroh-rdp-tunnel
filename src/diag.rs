@@ -124,9 +124,7 @@ pub fn render(report: &DiagReport) -> String {
     out.push_str(
         " NAT 过滤行为     : 未测量（iroh 无法直接探测；严格验证见 netdiag/filter-proof.js）\n",
     );
-    out.push_str(&format!(
-        "                   → 但这不阻断直连：iroh 的打洞走「双方同时发包」\n"
-    ));
+    out.push_str("                   → 但这不阻断直连：iroh 的打洞走「双方同时发包」\n");
     out.push_str(&format!(
         " UDP 可用         : IPv4 {}   IPv6 {}\n",
         if p.udp_v4 { "✅" } else { "❌" },
