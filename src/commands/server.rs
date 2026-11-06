@@ -20,6 +20,7 @@ use crate::{
     config::ServerConfig,
     endpoint::{EndpointOptions, bind},
     keys::{load_or_create_secret_key, write_endpoint_id_hint},
+    pathinfo::spawn_path_reporter,
     tunnel::bridge_quic_to_tcp,
 };
 
@@ -57,6 +58,7 @@ impl ProtocolHandler for BridgeHandler {
         }
 
         tracing::info!("收到来自 {remote} 的连接");
+        spawn_path_reporter(conn.clone(), "server");
 
         loop {
             let (send, recv) = match conn.accept_bi().await {

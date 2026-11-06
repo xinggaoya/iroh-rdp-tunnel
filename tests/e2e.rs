@@ -16,6 +16,7 @@ use iroh_rdp_tunnel::{
     commands::server::{self, ServerRuntime},
     config::ServerConfig,
     endpoint::{Discovery, EndpointOptions, bind},
+    pathinfo,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -113,6 +114,19 @@ async fn tunnel_roundtrip_preserves_bytes() {
     let client = start_client(relay_url).await;
 
     let conn = client.connect(remote, ALPN).await.unwrap();
+
+    // 连上之后必须能判定当前走的是直连还是中继。
+    let info = pathinfo::describe_path(&conn).expect("连接建立后应能读到当前路径");
+    assert!(
+        matches!(
+            info.kind,
+            pathinfo::PathKind::Direct | pathinfo::PathKind::Relay
+        ),
+        "路径类型必须可判定，实际: {:?}",
+        info.kind
+    );
+    assert!(!info.remote.is_empty(), "路径必须有远端地址");
+
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
 
     let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();

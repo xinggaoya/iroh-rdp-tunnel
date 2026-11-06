@@ -10,6 +10,7 @@ pub mod config;
 pub mod connmgr;
 pub mod endpoint;
 pub mod keys;
+pub mod pathinfo;
 pub mod tunnel;
 
 /// QUIC 握手中协商的 ALPN；两端必须完全一致。

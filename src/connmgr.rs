@@ -10,7 +10,7 @@ use anyhow::Result;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use tokio::sync::watch;
 
-use crate::ALPN;
+use crate::{ALPN, pathinfo::spawn_path_reporter};
 
 /// 首次重连前的等待时长。
 pub const BASE_RECONNECT_DELAY: Duration = Duration::from_millis(200);
@@ -84,6 +84,7 @@ async fn connection_loop(
             Ok(conn) => {
                 attempt = 0;
                 tracing::info!("已与远端 {remote} 建立连接");
+                spawn_path_reporter(conn.clone(), "client");
                 let _ = tx.send(Some(conn.clone()));
                 // 等连接关闭（对端断开或传输出错）后再重连。
                 let _ = conn.closed().await;
