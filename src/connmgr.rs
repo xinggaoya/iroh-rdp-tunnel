@@ -10,7 +10,10 @@ use anyhow::Result;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use tokio::sync::watch;
 
-use crate::{ALPN, pathinfo::spawn_path_reporter};
+use crate::{
+    ALPN,
+    pathinfo::{spawn_direct_wait_notice, spawn_relay_consistency_check},
+};
 
 /// 首次重连前的等待时长。
 pub const BASE_RECONNECT_DELAY: Duration = Duration::from_millis(200);
@@ -76,6 +79,17 @@ impl ConnManager {
         self.remote
     }
 
+    /// 当前连接（若有），**不等待**。
+    ///
+    /// 已经关闭的连接会被跳过 —— 拿到一条死连接比拿不到更糟。
+    /// 供路径状态轮询使用（不能为了看一眼路径状态就阻塞等待）。
+    pub fn current(&self) -> Option<iroh::endpoint::Connection> {
+        self.conn_rx
+            .borrow()
+            .clone()
+            .filter(|c| c.close_reason().is_none())
+    }
+
     /// 取当前可用连接；尚无连接则等待，最多等 `timeout`。
     ///
     /// 会跳过**已经关闭**的连接：连接刚断时，后台任务还没来得及把 watch 里的
@@ -114,7 +128,10 @@ async fn connection_loop(
             Ok(conn) => {
                 let connected_at = Instant::now();
                 tracing::info!("已与远端 {remote} 建立连接");
-                spawn_path_reporter(conn.clone(), "client", endpoint.clone());
+                // iroh 特有的两件事：��继一致性检查 + 直连观察窗口。
+                // 路径状态本身由传输层的事件流统一报告。
+                spawn_relay_consistency_check(conn.clone(), endpoint.clone(), "client");
+                spawn_direct_wait_notice("client");
                 let _ = tx.send(Some(conn.clone()));
                 // 等连接关闭（对端断开或传输出错）后再重连。
                 let _ = conn.closed().await;

@@ -8,92 +8,32 @@
 use std::net::SocketAddr;
 
 use anyhow::Result;
-use iroh::{
-    Endpoint, EndpointId, RelayMode,
-    Watcher as _,
-    endpoint::Connection,
-    protocol::{AcceptError, ProtocolHandler, Router},
-};
+use iroh::{Endpoint, EndpointId, RelayMode, Watcher as _};
 use tokio::net::TcpStream;
 
 use crate::{
-    ALPN, BUILD_TAG,
+    BUILD_TAG,
     config::ServerConfig,
     endpoint::{EndpointOptions, bind},
     fw::{RULE_NAME, current_exe, status, status_hint},
-    keys::{load_or_create_secret_key, write_endpoint_id_hint},
-    pathinfo::spawn_path_reporter,
-    tunnel::bridge_quic_to_tcp,
+    keys::{load_or_create_secret_key, load_or_create_rustp2p_identity, write_endpoint_id_hint},
+    transport::{
+        TransportEndpoint, TransportKind,
+        iroh::IrohTransport,
+        rustp2p::{Rustp2pOptions, Rustp2pTransport},
+    },
+    tunnel::bridge_stream_to_tcp,
 };
 
 /// 被控端运行时。
 ///
-/// 拆成运行时与执行循环是为了让集成测试能直接拿到 [`Endpoint`] 与处理器，
+/// 拆成运行时与执行循环是为了让集成测试能直接拿到 [`Endpoint`] 与传输端点，
 /// 自己驱动 accept，而不必走完整的进程流程。
 pub struct ServerRuntime {
     /// 已绑定、已连上 relay 的 iroh 端点。
     pub endpoint: Endpoint,
-    /// 把 QUIC 流桥到本机 RDP 的协议处理器。
-    pub handler: BridgeHandler,
-}
-
-/// 协议处理器：把每条入站 QUIC 双向流桥到本机 RDP。
-#[derive(Debug, Clone)]
-pub struct BridgeHandler {
-    /// 本机 RDP 地址。
-    pub rdp_target: SocketAddr,
-    /// 允许接入的 endpoint id 白名单；空表示不限制。
-    pub allow_list: Vec<EndpointId>,
-    /// 本机端点 —— 用于读取 home relay（检测两端中继是否一致）。
-    pub endpoint: Endpoint,
-}
-
-impl ProtocolHandler for BridgeHandler {
-    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        let remote = conn.remote_id();
-
-        if !self.allow_list.is_empty() && !self.allow_list.contains(&remote) {
-            let msg = format!("endpoint {remote} 不在白名单内，拒绝接入");
-            tracing::warn!("{msg}");
-            return Err(AcceptError::from(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                msg,
-            )));
-        }
-
-        tracing::info!("收到来自 {remote} 的连接");
-        spawn_path_reporter(conn.clone(), "server", self.endpoint.clone());
-
-        loop {
-            let (mut send, recv) = match conn.accept_bi().await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::info!("accept 循环结束（{remote}）: {e}");
-                    return Ok(());
-                }
-            };
-
-            let tcp = match TcpStream::connect(self.rdp_target).await {
-                Ok(t) => t,
-                Err(e) => {
-                    // 只关掉**这一条**流，不要拆掉整条 QUIC 连接 ——
-                    // 同一连接上可能还有别的流在用。
-                    tracing::warn!(
-                        "本机 RDP 未在 {} 上运行: {e}（关闭本条流，连接继续服务）",
-                        self.rdp_target
-                    );
-                    let _ = send.reset(1u32.into());
-                    continue;
-                }
-            };
-
-            tokio::spawn(async move {
-                if let Err(e) = bridge_quic_to_tcp(send, recv, tcp).await {
-                    tracing::warn!("桥接结束: {e}");
-                }
-            });
-        }
-    }
+    /// 传输层端点 —— 负责接受入站连接并把流交出来。
+    pub transport: std::sync::Arc<dyn TransportEndpoint>,
 }
 
 /// 组装被控端运行时：加载密钥、绑定端点、连上 relay。
@@ -113,14 +53,49 @@ pub async fn build(cfg: &ServerConfig) -> Result<ServerRuntime> {
 
     tracing::debug!("endpoint {endpoint_id} 已绑定");
 
+    let transport = IrohTransport::new_server(endpoint.clone(), cfg.allow_list.clone());
+
     Ok(ServerRuntime {
-        handler: BridgeHandler {
-            rdp_target: cfg.rdp_target,
-            allow_list: cfg.allow_list.clone(),
-            endpoint: endpoint.clone(),
-        },
         endpoint,
+        transport,
     })
+}
+
+/// 接受入站流并桥接到本机 RDP。
+///
+/// 每条流一个任务：一条流坏了不影响别的流，也不影响整条连接。
+pub async fn serve(
+    transport: std::sync::Arc<dyn TransportEndpoint>,
+    rdp_target: SocketAddr,
+) -> Result<()> {
+    loop {
+        let accepted = match transport.accept_stream().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("接受入站流失败: {e}");
+                return Err(e);
+            }
+        };
+
+        tokio::spawn(async move {
+            let tcp = match TcpStream::connect(rdp_target).await {
+                Ok(t) => t,
+                Err(e) => {
+                    // 只关掉**这一条**流，不要拆掉整条连接 ——
+                    // 同一连接上可能还有别的流在用。
+                    tracing::warn!(
+                        "本机 RDP 未在 {} 上运行: {e}（关闭本条流，连接继续服务）",
+                        rdp_target
+                    );
+                    return;
+                }
+            };
+
+            if let Err(e) = bridge_stream_to_tcp(accepted.stream, tcp).await {
+                tracing::warn!("桥接结束: {e}");
+            }
+        });
+    }
 }
 
 /// 等 relay 连接的超时。
@@ -147,15 +122,97 @@ pub fn needs_relay_wait(relay_mode: &RelayMode) -> bool {
 }
 
 /// 运行被控端。
+///
+/// 按传输后端分派：iroh 走 n0 公共中继与 pkarr 发现；
+/// rustp2p 走自建中继与端口预测打洞（能对付对称 NAT）。
 pub async fn run(cfg: ServerConfig) -> Result<()> {
+    match cfg.transport {
+        TransportKind::Iroh => run_iroh(cfg).await,
+        TransportKind::Rustp2p => run_rustp2p(cfg).await,
+    }
+}
+
+/// rustp2p 后端的被控端。
+///
+/// 与 iroh 路径的差别：
+/// - 对端用 **peer id** 而不是 endpoint id；
+/// - 需要 bootstrap 节点（公网 VPS，兼作中继）；
+/// - 打洞由 rustp2p 的端口预测 + 扫描自动完成，不需要手工干预。
+async fn run_rustp2p(cfg: ServerConfig) -> Result<()> {
+    // node_id 留空 = 让它随机生成并持久化 —— 空字符串不是合法 peer id。
+    let requested = (!cfg.rustp2p.node_id.trim().is_empty())
+        .then_some(cfg.rustp2p.node_id.as_str());
+    let identity = load_or_create_rustp2p_identity(&cfg.rustp2p.identity_file, requested)?;
+
+    let opts = Rustp2pOptions {
+        peer_id: identity.peer_id.clone(),
+        seed: identity.seed.clone(),
+        bind: cfg.rustp2p.bind,
+        bootstrap: cfg.rustp2p.bootstrap.clone(),
+        stun_servers: cfg.rustp2p.stun_servers.clone(),
+        max_assistant_sockets: cfg.rustp2p.max_assistant_sockets,
+        punch_whitelist: None,
+        allow_list: cfg.allow_peers.clone(),
+    };
+    let transport = Rustp2pTransport::build(&opts, vec![], "server").await?;
+
+    println!();
+    println!("=========================================================");
+    println!(" iroh-rdp-tunnel SERVER  ({BUILD_TAG})  [rustp2p]");
+    println!("=========================================================");
+    println!(" 本机 peer id : {}", identity.peer_id);
+    println!(
+        "                （把它填给控制端: irt client --transport rustp2p --peer {}）",
+        identity.peer_id
+    );
+    if cfg.rustp2p.bootstrap.is_empty() {
+        println!(" bootstrap    : （未指定）—— 没有 bootstrap 就发现不了对端！");
+    } else {
+        let list = cfg
+            .rustp2p
+            .bootstrap
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(" bootstrap    : {list}");
+    }
+    println!(" STUN         : {}", cfg.rustp2p.stun_servers.join(", "));
+    if !cfg.allow_peers.is_empty() {
+        println!(" peer 白名单   : {}", cfg.allow_peers.join(", "));
+        println!("                （只是字符串比对，不是身份认证）");
+    }
+    println!(" 本机 RDP     : {}", cfg.rdp_target);
+    println!();
+
+    let accept_task = tokio::spawn({
+        let transport = transport.clone();
+        async move { serve(transport, cfg.rdp_target).await }
+    });
+
+    println!(" 等待客户端连接…  (Ctrl-C 退出)");
+    println!();
+
+    tokio::signal::ctrl_c().await?;
+    println!("\n正在关闭…");
+    accept_task.abort();
+    transport.close().await;
+    Ok(())
+}
+
+/// iroh 后端的被控端（v0.2 的既有路径，行为不变）。
+async fn run_iroh(cfg: ServerConfig) -> Result<()> {
     let rt = build(&cfg).await?;
     let endpoint_id = rt.endpoint.id();
     // 顺手把 id 写一份纯文本，方便用户复制。
     let _ = write_endpoint_id_hint(&cfg.key_file, endpoint_id);
 
-    let router = Router::builder(rt.endpoint.clone())
-        .accept(ALPN, rt.handler.clone())
-        .spawn();
+    // 传输层已经在 `build()` 里把 Router 跑起来了，
+    // 这里只需要在后台把入站流桥到本机 RDP。
+    let accept_task = tokio::spawn({
+        let transport = rt.transport.clone();
+        async move { serve(transport, cfg.rdp_target).await }
+    });
 
     // 先把关键信息打出来 —— endpoint id 必须**立即**可见，
     // 不能因为 relay 连不上就卡住不输出。
@@ -202,8 +259,9 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
     tokio::signal::ctrl_c().await?;
     println!("
 正在关闭…");
-    router.shutdown().await?;
-    // Router::shutdown 会关掉 endpoint；再调一次只为避免
+    accept_task.abort();
+    rt.transport.close().await;
+    // transport.close() 会关掉 endpoint；再调一次只为避免
     // "Endpoint dropped without calling close()" 的告警。
     let _ = rt.endpoint.close().await;
     Ok(())

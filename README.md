@@ -4,6 +4,25 @@
 
 **实际使用仍然使用系统自带的远程桌面工具**（mstsc / 移动端 RD Client / macOS Microsoft Remote Desktop），不需要安装任何额外的客户端软件。
 
+> **v0.3：两个传输后端**
+>
+> v0.2 只能用 iroh，而 iroh 的打洞候选**只**来自中继观测到的端点 ——
+> 在**对称 NAT**（映射随目标变化）下必然对不上号，打洞**永远**打不通。
+> v0.3 加了第二个后端 [rustp2p-quic](https://github.com/rustp2p/rustp2p)，
+> 它用「端口预测 + 全局随机扫描」正面破对称 NAT。
+>
+> | | `--transport iroh`（默认） | `--transport rustp2p` |
+> |---|---|---|
+> | **一定能连上吗** | ✅ 一定能（走中继） | ❌ 不一定 —— **打洞成功前连不上** |
+> | **能直连吗** | ❌ 对称 NAT 下永远不能 | ✅ 能（实测 205ms） |
+> | 延迟 | 高（实测 1200ms） | 低 |
+> | 需要自建服务器 | 否 | 是（VPS 上一个 node 即可） |
+> | 怎么选 | **保底**：先保证 RDP 能用 | **争取直连**：延迟敏感时用 |
+>
+> ⚠️ **rustp2p 的中继兜底与 iroh 不是一回事** ——
+> rustp2p 的中继是**协议层转发**，QUIC 流的建立仍需要一条已确认的路由，
+> 所以**打洞成功前它是连不上的**。详见「rustp2p 后端」一节。
+>
 > **v0.2 与旧版的差异**
 >
 > | | 旧版 | v0.2 |
@@ -481,6 +500,72 @@ net report 要连上 relay、跑完多个中继的对比才出结果，**实测�
 `irt diag` 的 `端口映射` 一行就是在测这个。**在**控制端**跑 `irt diag`**：
 若 UPnP ✅，iroh 会自动申请端口映射 ⇒ 对称 NAT 被破解 ⇒ 直连可成。
 
+### v0.3 的解法：rustp2p 后端
+
+既然 iroh 破不了对称 NAT，v0.3 就换了个**用端口预测破局**的传输层：
+[rustp2p-quic](https://github.com/rustp2p/rustp2p)（Apache-2.0）。
+
+它的做法是：
+
+1. 通过 STUN 观测自己的**公网映射端口集合**，算出「端口分配范围」
+   （对称 NAT 下这个范围可能高达几万个端口）；
+2. 打洞时先用**端口预测**猜对端可能用的端口；
+3. 猜不中就**全局随机扫描**（每轮 1200~1500 个端口，持久游标）；
+4. 辅助 socket（assistant sockets）增加映射端口的散布范围。
+
+**实测（同一台机器、同一网络、家宽为对称 NAT）**：
+
+```
+iroh    ：[路径·client] ⚠ 30 秒内未建立**公网**直连路径，当前走中继
+rustp2p ：[路径·client] ✅ 已切换到直连  107.172.191.12:2525  RTT 200ms
+```
+
+#### 怎么用
+
+需要一台**有公网 IPv4、UDP 可达**的 VPS 上跑一个 rustp2p 节点
+（它同时当 bootstrap 与中继）。部署手册见
+[`docs/deploy/rustp2p-node-vps.md`](docs/deploy/rustp2p-node-vps.md)。
+
+```powershell
+# 被控端
+irt server --transport rustp2p --node-id my-server ^
+           --bootstrap <VPS_IP>:6888
+
+# 控制端
+irt client --transport rustp2p --peer my-server ^
+           --bootstrap <VPS_IP>:6888
+```
+
+> ⚠️ **两端必须用同一个「公网可达」的 bootstrap 地址**。
+> 被控端若写 `--bootstrap 127.0.0.1:6888`（因为节点就在本机），
+> 中继观测到的它的公网端点会是 `127.0.0.1:xxxxx` ⇒ 客户端永远打不到。
+
+**可用的环境变量**：`IRT_TRANSPORT` / `IRT_NODE_ID` / `IRT_PEER` /
+`IRT_BOOTSTRAP` / `IRT_STUN` / `IRT_ASSISTANT_SOCKETS`。
+
+#### rustp2p 的两个限制（务必知道）
+
+1. **打洞成功前连不上** —— 它的中继是协议层转发，QUIC 流仍需要已确认的路由。
+   实测打洞耗时可达 **4 分钟**（端口范围 3 万~6 万时）。
+   ⇒ **默认仍用 `--transport iroh` 保底**；需要低延迟时再切。
+2. **身份是降级的** —— `PeerId` 是任意字符串、证书校验被跳过，
+   `--allow-peer` 只是**字符串比对，不是认证**。别把它暴露在不可信网络上。
+
+#### 网络体检
+
+```powershell
+irt diag --transport rustp2p
+```
+
+会额外给出**端口分配范围**（端口预测的候选空间）—— 这个数字直接决定
+「直连要多久」：
+
+```
+ NAT 映射行为     : 对称 NAT（映射随目标变化）  🟡 端点对不上号，但 rustp2p 靠端口穷举可破
+ 对称端口范围     : 33655 个端口（端口预测的候选空间）
+ 判定: 🟡 直连有戏但要靠端口穷举 —— 打不成会自动回落到中继
+```
+
 ### 顺带：两个可以忽略的告警
 
 | 告警 | 含义 |
@@ -498,6 +583,7 @@ net report 要连上 relay、跑完多个中继的对比才出结果，**实测�
 | **一直显示「中继」，没有「✅ 已切换到直连」** | 1. 防火墙规则装了吗（**最常见原因**）<br>2. 跑 `irt diag` 看映射行为是不是 EIM<br>3. 中继延迟高（>150ms）？换一个更近的 relay：`irt server --relay https://aps1-1.relay.n0.iroh.link./`<br>4. 对端也在 NAT 后面？**双方都要能打洞** |
 | **首帧很慢，之后正常** | 打洞本身要几次往返，第一次连接会慢一些。第二次连接因为连接已建立会很快 |
 | **mstsc 报「无法连接到 127.0.0.1:13389」** | client 没运行；或端口被占用；或本机防火墙拦了本地回环 |
+| **rustp2p 后端连不上** | 1. 两端用的是**同一个公网** bootstrap 吗（被控端别写 `127.0.0.1`）<br>2. VPS 的端口在 1Panel 白名单里吗（tcp+udp 都要）—— 未放行会被**静默 DROP**<br>3. 打洞可能要几分钟，看 client 输出里「打开到 xxx 的双向流等待超过 30 秒」<br>4. 等不及就切回 `--transport iroh` 保底 |
 | **远端提示「本机 RDP 未在 127.0.0.1:3389 上运行」** | 被控端没启用 RDP：`reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f` |
 | **远程桌面提示账户密码错误** | RDP 要求**被控端本机账户** + 密码；某些家庭版 / 简化账户请改成 Microsoft 账户 |
 | **想禁止别人接入** | `irt server --allow <endpoint_id>`（可重复），或用 `IRT_ALLOW` 环境变量 |

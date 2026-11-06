@@ -1,0 +1,31 @@
+# rustp2p 节点（bootstrap + 中继）—— 供 iroh-rdp-tunnel 的 rustp2p 后端使用。
+#
+# 为什么需要它：
+#   iroh 的打洞候选只来自中继观测到的端点，在**对称 NAT** 下必然对不上号。
+#   rustp2p 用「端口预测 + 全局随机扫描」破对称 NAT，中继必须是自己能控的。
+#
+# 端口 6888：**必须在 1Panel 的防火墙白名单里**（tcp + udp 都要放行），
+#   否则 1PANEL_BASIC_AFTER 链会静默 DROP 掉未放行的包 —— 表现为
+#   「bootstrap hello timed out」，很容易误判成程序问题。
+services:
+  rustp2p-node:
+    build: .
+    image: rustp2p-node:v0.3
+    container_name: irt-rustp2p-node
+    restart: unless-stopped
+    # seed 决定证书 —— **必须固定**，否则每次重建容器 peer id/证书都会变。
+    command:
+      - --id
+      - vps-node
+      - --seed
+      - vps-node-seed
+      - --bind
+      - 0.0.0.0:6888
+    # 用 host 网络而不是端口映射 —— 端口映射会走 docker-proxy（用户态代理），
+    # 中继转发 RDP 流量时白白多一跳、内核态收发也被打断。
+    network_mode: host
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

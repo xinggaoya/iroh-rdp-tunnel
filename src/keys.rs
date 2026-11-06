@@ -225,3 +225,132 @@ mod tests {
         assert_eq!(hint.trim(), hint.trim().to_lowercase());
     }
 }
+
+/// rustp2p 的本机身份：peer id + 证书种子。
+///
+/// rustp2p-quic 的 `Identity::new(peer_id, seed)` 用 seed 确定性地生成证书，
+/// 所以**种子必须持久化** —— 丢了就等于换了一台机器。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rustp2pIdentity {
+    /// 本机 peer id。
+    pub peer_id: String,
+    /// 证书种子（32 字节随机）。
+    pub seed: Vec<u8>,
+}
+
+/// 身份文件里的 JSON 结构。
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct IdentityFile {
+    /// 本机 peer id。
+    peer_id: String,
+    /// 证书种子（十六进制）。
+    seed: String,
+}
+
+/// 读取或创建 rustp2p 身份。
+///
+/// - `peer_id` 为 `None` 时，沿用文件里已有的 id；文件不存在则生成一个
+///   **随机长字符串**（降级安全姿态：peer id 不可预测，见设计文档 §9.4）。
+/// - `peer_id` 为 `Some(v)` 时，以参数为准 —— 但种子仍然沿用文件里的，
+///   换了 peer id 也保持同一份证书。
+pub fn load_or_create_rustp2p_identity(
+    path: &Path,
+    peer_id: Option<&str>,
+) -> anyhow::Result<Rustp2pIdentity> {
+    if path.exists() {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("读取身份文件失败: {}", path.display()))?;
+        let parsed: IdentityFile = serde_json::from_str(&raw)
+            .with_context(|| format!("解析身份文件失败: {}", path.display()))?;
+        let seed = hex_decode(&parsed.seed)
+            .with_context(|| format!("身份文件里的 seed 不是合法十六进制: {}", path.display()))?;
+        let peer_id = peer_id.unwrap_or(&parsed.peer_id).to_string();
+        return Ok(Rustp2pIdentity { peer_id, seed });
+    }
+
+    // 文件不存在 → 新建。
+    let peer_id = match peer_id {
+        Some(v) => v.to_string(),
+        None => generate_peer_id(),
+    };
+    let seed = random_bytes(32);
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("创建目录失败: {}", parent.display()))?;
+        }
+    }
+    let payload = IdentityFile {
+        peer_id: peer_id.clone(),
+        seed: hex_encode(&seed),
+    };
+    let text = serde_json::to_string_pretty(&payload).context("序列化身份失败")?;
+    let tmp = tmp_sibling(path);
+    std::fs::write(&tmp, text.as_bytes())
+        .with_context(|| format!("写入身份文件失败: {}", tmp.display()))?;
+    match std::fs::hard_link(&tmp, path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        Err(_) => {
+            if path.exists() {
+                let _ = std::fs::remove_file(&tmp);
+                // 另一个进程抢先创建了 → 用磁盘上那份。
+                return load_or_create_rustp2p_identity(path, Some(&peer_id));
+            }
+            let _ = std::fs::remove_file(&tmp);
+            std::fs::rename(&tmp, path)
+                .with_context(|| format!("重命名身份文件失败: {}", path.display()))?;
+        }
+    }
+    Ok(Rustp2pIdentity { peer_id, seed })
+}
+
+/// 生成一个随机长 peer id。
+///
+/// rustp2p 的 peer id 是**应用层**的任意字符串，没有密码学强度 ——
+/// 它的证书校验又被降级为跳过。所以这里只能做到「不可预测」，
+/// 不能当作身份认证。真正的防线是**不把它暴露在不可信网络上**。
+fn generate_peer_id() -> String {
+    format!("irt-{}", hex_encode(&random_bytes(16)))
+}
+
+/// 生成随机字节。
+///
+/// 用标准库的 `RandomState` —— 它的种子是系统随机源，
+/// 不必为此引入 `rand` 依赖（顺带避开 rand 0.9/0.10 的 API 变动）。
+fn random_bytes(n: usize) -> Vec<u8> {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+
+    let mut out = Vec::with_capacity(n + 8);
+    let mut state = RandomState::new().build_hasher();
+    while out.len() < n {
+        state.write_usize(out.len());
+        out.extend_from_slice(&state.finish().to_le_bytes());
+    }
+    out.truncate(n);
+    out
+}
+
+/// 十六进制编码（小写）。
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// 十六进制解码。
+fn hex_decode(s: &str) -> anyhow::Result<Vec<u8>> {
+    let s = s.trim();
+    if !s.len().is_multiple_of(2) {
+        anyhow::bail!("十六进制串长度必须是偶数，实际 {} 位", s.len());
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(Into::into))
+        .collect()
+}

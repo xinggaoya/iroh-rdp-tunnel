@@ -6,6 +6,7 @@
 //! 与远端保持**一条**常驻 QUIC 连接（见 [`crate::connmgr`]），
 //! 每条本地 TCP 连接只开一条 QUIC 双向流 —— 打洞只发生一次。
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -16,15 +17,18 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::{
     BUILD_TAG,
     config::ClientConfig,
-    connmgr::ConnManager,
     endpoint::{EndpointOptions, bind_resolver_only},
-    keys::{load_or_create_secret_key, write_endpoint_id_hint},
-    tunnel::bridge_tcp_to_quic,
+    keys::{load_or_create_secret_key, load_or_create_rustp2p_identity, write_endpoint_id_hint},
+    transport::{
+        PeerRef, TransportEndpoint, TransportKind,
+        iroh::IrohTransport,
+        rustp2p::{Rustp2pOptions, Rustp2pTransport},
+    },
+    tunnel::bridge_tcp_to_stream,
 };
 
 /// 等待远端连接就绪的超时。
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-
+///
 /// 等待本机 net report 就绪的超时。
 ///
 /// **这个等待很关键**：打洞时客户端要用 `REACH_OUT` 帧通告自己的公网候选，
@@ -35,7 +39,93 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const NET_REPORT_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// 运行控制端。
+///
+/// 按传输后端分派：iroh 走 n0 公共中继与 pkarr 发现；
+/// rustp2p 走自建中继与端口预测打洞（能对付对称 NAT）。
 pub async fn run(cfg: ClientConfig) -> Result<()> {
+    match cfg.transport {
+        TransportKind::Iroh => run_iroh(cfg).await,
+        TransportKind::Rustp2p => run_rustp2p(cfg).await,
+    }
+}
+
+/// rustp2p 后端的控制端。
+///
+/// 与 iroh 路径的差别：
+/// - 对端用 **peer id** 而不是 endpoint id；
+/// - 需要 bootstrap 节点（公网 VPS，兼作中继）；
+/// - 打洞由 rustp2p 的端口预测 + 扫描自动完成，不需要手工干预。
+async fn run_rustp2p(cfg: ClientConfig) -> Result<()> {
+    let peer_id = cfg
+        .peer
+        .clone()
+        .context("缺少对端 peer id（--peer 或位置参数）")?;
+
+    // node_id 留空 = 让它随机生成并持久化 —— 空字符串不是合法 peer id。
+    let requested = (!cfg.rustp2p.node_id.trim().is_empty())
+        .then_some(cfg.rustp2p.node_id.as_str());
+    let identity = load_or_create_rustp2p_identity(&cfg.rustp2p.identity_file, requested)?;
+
+    let opts = Rustp2pOptions {
+        peer_id: identity.peer_id.clone(),
+        seed: identity.seed.clone(),
+        bind: cfg.rustp2p.bind,
+        bootstrap: cfg.rustp2p.bootstrap.clone(),
+        stun_servers: cfg.rustp2p.stun_servers.clone(),
+        max_assistant_sockets: cfg.rustp2p.max_assistant_sockets,
+        punch_whitelist: None,
+        allow_list: Vec::new(),
+    };
+    let transport = Rustp2pTransport::build(
+        &opts,
+        vec![rustp2p_quic::PeerId::new(peer_id.clone())],
+        "client",
+    )
+    .await?;
+
+    let listener = TcpListener::bind(cfg.listen)
+        .await
+        .with_context(|| format!("无法绑定本地 TCP {}", cfg.listen))?;
+
+    println!();
+    println!("=========================================================");
+    println!(" iroh-rdp-tunnel CLIENT  ({BUILD_TAG})  [rustp2p]");
+    println!("=========================================================");
+    println!(" 本机 peer id : {}", identity.peer_id);
+    println!(" 对端 peer id : {peer_id}");
+    if cfg.rustp2p.bootstrap.is_empty() {
+        println!(" bootstrap    : （未指定）—— 没有 bootstrap 就发现不了对端！");
+    } else {
+        let list = cfg
+            .rustp2p
+            .bootstrap
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(" bootstrap    : {list}");
+    }
+    println!(" STUN         : {}", cfg.rustp2p.stun_servers.join(", "));
+    println!(" 本地 TCP 监听 : {}", cfg.listen);
+    println!();
+    println!(" 用系统自带的远程桌面连接本机端口:");
+    println!("     Windows : mstsc /v:{}", cfg.listen);
+    println!(" (Ctrl-C 退出)");
+    println!();
+
+    tokio::select! {
+        r = serve_local(transport.clone(), PeerRef::Rustp2p(peer_id), listener) => r,
+        r = tokio::signal::ctrl_c() => {
+            r?;
+            println!("\n正在关闭…");
+            transport.close().await;
+            Ok(())
+        }
+    }
+}
+
+/// iroh 后端的控制端（v0.2 的既有路径，行为不变）。
+async fn run_iroh(cfg: ClientConfig) -> Result<()> {
     // 控制端也持久化自己的私钥：id 固定之后才能写进被控端的 `--allow` 白名单。
     let secret_key = load_or_create_secret_key(&cfg.key_file)?;
     let local_id = secret_key.public();
@@ -71,7 +161,11 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
     }
 
     // 后台立即开始建连（打洞也随之开始），不等到用户打开 mstsc。
-    let mgr = ConnManager::start(endpoint.clone(), cfg.remote);
+    let remote = cfg
+        .remote
+        .context("iroh 后端缺少远端 endpoint id")?;
+    let transport = IrohTransport::new_client(endpoint.clone(), remote, None);
+    let peer = PeerRef::Iroh(remote);
 
     let listener = TcpListener::bind(cfg.listen)
         .await
@@ -81,7 +175,7 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
     println!("=========================================================");
     println!(" iroh-rdp-tunnel CLIENT  ({BUILD_TAG})");
     println!("=========================================================");
-    println!(" 远端 endpoint : {}", cfg.remote);
+    println!(" 远端 endpoint : {}", remote);
     println!(" 本机 endpoint : {local_id}");
     println!("                 （可写进被控端的 --allow 白名单）");
     println!(" 本地 TCP 监听 : {}", cfg.listen);
@@ -128,10 +222,11 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
     // Ctrl-C 时优雅关闭端点（否则 iroh 会报
     // "Endpoint dropped without calling close()"）。
     tokio::select! {
-        r = serve_local(mgr, listener) => r,
+        r = serve_local(transport.clone(), peer, listener) => r,
         r = tokio::signal::ctrl_c() => {
             r?;
             println!("\n正在关闭…");
+            transport.close().await;
             endpoint.close().await;
             Ok(())
         }
@@ -142,20 +237,25 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
 ///
 /// 抽出来是为了让集成测试能驱动**与生产完全相同**的这条路径
 /// （本地 TCP → 常驻 QUIC 连接 → 远端）。
-pub async fn serve_local(mgr: ConnManager, listener: TcpListener) -> Result<()> {
+pub async fn serve_local(
+    transport: Arc<dyn TransportEndpoint>,
+    remote: PeerRef,
+    listener: TcpListener,
+) -> Result<()> {
     loop {
-        let (tcp, peer) = match listener.accept().await {
+        let (tcp, tcp_peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("本地 TCP accept 失败: {e}");
                 continue;
             }
         };
-        tracing::info!("本地 RDP 客户端接入: {peer}");
+        tracing::info!("本地 RDP 客户端接入: {tcp_peer}");
 
-        let mgr = mgr.clone();
+        let transport = transport.clone();
+        let remote = remote.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_session(mgr, tcp).await {
+            if let Err(e) = handle_session(transport, remote, tcp).await {
                 tracing::warn!("会话结束: {e:#}");
             }
         });
@@ -163,21 +263,16 @@ pub async fn serve_local(mgr: ConnManager, listener: TcpListener) -> Result<()> 
 }
 
 /// 把一条本地 TCP 连接桥接到远端。
-pub async fn handle_session(mgr: ConnManager, local: TcpStream) -> Result<()> {
-    let conn = mgr.connection(CONNECT_TIMEOUT).await?;
-    // 连接可能刚好在这一瞬间断开，open_bi 会失败 —— 换一条新连接重试一次。
-    let (send, recv) = match conn.open_bi().await {
-        Ok(s) => s,
-        Err(first) => {
-            tracing::warn!("打开 QUIC 双向流失败（连接可能刚断开）: {first}，重试一次");
-            let conn = mgr.connection(CONNECT_TIMEOUT).await?;
-            conn.open_bi()
-                .await
-                .context("重试后仍无法打开 QUIC 双向流")?
-        }
-    };
-    bridge_tcp_to_quic(local, send, recv)
+pub async fn handle_session(
+    transport: Arc<dyn TransportEndpoint>,
+    peer: PeerRef,
+    local: TcpStream,
+) -> Result<()> {
+    // 打开到远端的流（连接刚断时后端会自己重试一次）。
+    let stream = transport
+        .open_stream(&peer)
         .await
-        .context("桥接失败")?;
+        .context("打开到远端的流失败")?;
+    bridge_tcp_to_stream(local, stream).await.context("桥接失败")?;
     Ok(())
 }

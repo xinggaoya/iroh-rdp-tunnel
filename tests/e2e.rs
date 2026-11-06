@@ -13,16 +13,15 @@ use std::{collections::BTreeSet, net::SocketAddr, path::PathBuf, time::Duration}
 
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr,
-    protocol::Router,
 };
 use iroh_rdp_tunnel::{
     ALPN,
     addrpolicy::PublishPolicy,
     commands::server::{self, ServerRuntime},
     config::ServerConfig,
-    connmgr::ConnManager,
     endpoint::{Discovery, EndpointOptions, bind},
     pathinfo,
+    transport::{PeerRef, iroh::IrohTransport},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -64,12 +63,12 @@ fn temp_key_file(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("irt-e2e-{tag}-{n}.key"))
 }
 
-/// 起一个被控端，返回 (远端地址, 运行时, router)。
+/// 起一个被控端，返回 (远端地址, 运行时)。
 async fn start_server(
     relay_url: RelayUrl,
     rdp_target: SocketAddr,
     allow_list: Vec<EndpointId>,
-) -> (EndpointAddr, ServerRuntime, Router) {
+) -> (EndpointAddr, ServerRuntime) {
     let cfg = ServerConfig {
         key_file: temp_key_file("server"),
         rdp_target,
@@ -78,20 +77,26 @@ async fn start_server(
         allow_list,
         discovery: Discovery::Disabled,
         ca_tls_config: Some(iroh::tls::CaTlsConfig::insecure_skip_verify()),
+        allow_peers: vec![],
+        transport: iroh_rdp_tunnel::transport::TransportKind::Iroh,
+        rustp2p: Default::default(),
     };
     let rt = server::build(&cfg).await.unwrap();
     // 等被控端连上 relay，否则控制端拨过去时 relay 还不认识它。
     tokio::time::timeout(Duration::from_secs(30), rt.endpoint.online())
         .await
         .expect("被控端未能在超时内连上 relay");
+    // accept 循环（Router 已由传输层内部拉起）。
+    let transport = rt.transport.clone();
+    tokio::spawn(async move {
+        let _ = server::serve(transport, rdp_target).await;
+    });
     let id = rt.endpoint.id();
-    let endpoint = rt.endpoint.clone();
-    let router = Router::builder(endpoint).accept(ALPN, rt.handler.clone()).spawn();
     let addr = EndpointAddr {
         id,
         addrs: BTreeSet::from([TransportAddr::Relay(relay_url)]),
     };
-    (addr, rt, router)
+    (addr, rt)
 }
 
 /// 起一个控制端端点。
@@ -116,7 +121,7 @@ async fn start_client(relay_url: RelayUrl) -> Endpoint {
 async fn tunnel_roundtrip_preserves_bytes() {
     let (_map, relay_url, _relay) = iroh::test_utils::run_relay_server().await.unwrap();
     let rdp = spawn_fake_rdp().await;
-    let (remote, _rt, _router) = start_server(relay_url.clone(), rdp, vec![]).await;
+    let (remote, _rt) = start_server(relay_url.clone(), rdp, vec![]).await;
     let client = start_client(relay_url).await;
 
     let conn = client.connect(remote, ALPN).await.unwrap();
@@ -158,7 +163,7 @@ async fn allow_list_rejects_unknown_peer() {
 
     // 白名单里放一个与客户端无关的 id
     let allowed = SecretKey::generate().public();
-    let (remote, _rt, _router) = start_server(relay_url.clone(), rdp, vec![allowed]).await;
+    let (remote, _rt) = start_server(relay_url.clone(), rdp, vec![allowed]).await;
     let client = start_client(relay_url).await;
 
     let outcome = tokio::time::timeout(Duration::from_secs(20), async {
@@ -195,7 +200,7 @@ async fn allow_list_accepts_listed_peer() {
     let client = start_client(relay_url.clone()).await;
     let client_id = client.id();
 
-    let (remote, _rt, _router) = start_server(relay_url.clone(), rdp, vec![client_id]).await;
+    let (remote, _rt) = start_server(relay_url.clone(), rdp, vec![client_id]).await;
 
     let conn = client.connect(remote, ALPN).await.unwrap();
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
@@ -215,17 +220,18 @@ async fn allow_list_accepts_listed_peer() {
 async fn client_local_tcp_path_roundtrips() {
     let (_map, relay_url, _relay) = iroh::test_utils::run_relay_server().await.unwrap();
     let rdp = spawn_fake_rdp().await;
-    let (remote, _rt, _router) = start_server(relay_url.clone(), rdp, vec![]).await;
+    let (remote, _rt) = start_server(relay_url.clone(), rdp, vec![]).await;
 
     let client_ep = start_client(relay_url).await;
     // 明确指定远端地址：测试里地址发现是关掉的。
-    let mgr = ConnManager::start_with_addr(client_ep, remote.id, remote.clone());
+    let transport = IrohTransport::new_client(client_ep, remote.id, Some(remote.clone()));
+    let peer = PeerRef::Iroh(remote.id);
 
     // 监听本地「假 RDP」端口。
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let local_addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let _ = iroh_rdp_tunnel::commands::client::serve_local(mgr, listener).await;
+        let _ = iroh_rdp_tunnel::commands::client::serve_local(transport, peer, listener).await;
     });
 
     // 像 mstsc 一样连上去。

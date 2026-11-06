@@ -120,28 +120,70 @@ pub fn render(report: &DiagReport) -> String {
             .map(|a| a.to_string())
             .unwrap_or_else(|| "（无全局地址）".to_string())
     ));
+    let is_iroh = p.transport == crate::transport::TransportKind::Iroh;
     out.push_str(&format!(
         " NAT 映射行为     : {}  {}\n",
         p.mapping.label(),
-        match p.mapping {
-            crate::nat::MappingBehavior::EndpointIndependent => "✅ 公网端点稳定，可通告",
-            crate::nat::MappingBehavior::Symmetric => "❌ 端点对不上号，直连会失败",
-            crate::nat::MappingBehavior::Unknown => "⚠ 未判定",
+        match (p.mapping, is_iroh) {
+            (crate::nat::MappingBehavior::EndpointIndependent, _) => "✅ 公网端点稳定，可通告",
+            // 同一个对称 NAT，iroh 判「无望」、rustp2p 判「可破」——
+            // 所以这里的措辞必须跟着后端走。
+            (crate::nat::MappingBehavior::Symmetric, true) => "❌ 端点对不上号，iroh 直连会失败",
+            (crate::nat::MappingBehavior::Symmetric, false) => {
+                "🟡 端点对不上号，但 rustp2p 靠端口穷举可破"
+            }
+            (crate::nat::MappingBehavior::Unknown, _) => "⚠ 未判定",
         }
     ));
-    // 过滤行为 iroh 测不了 —— 如实标注，不编造。
-    out.push_str(&format!(" NAT 过滤行为     : {FILTERING_NOT_MEASURED}\n"));
-    out.push_str("                   → 但这不阻断直连：iroh 的打洞走「双方同时发包」\n");
+    // 过滤行为两个后端都测不了 —— 如实标注，不编造。
     out.push_str(&format!(
-        " UDP 可用         : IPv4 {}   IPv6 {}\n",
-        if p.udp_v4 { "✅" } else { "❌" },
+        " NAT 过滤行为     : {}
+",
+        if is_iroh {
+            FILTERING_NOT_MEASURED
+        } else {
+            "未测量（两个后端都不直接探测过滤行为；严格验证请用外部 STUN 工具）"
+        }
+    ));
+    out.push_str(if is_iroh {
+        "                   → 但这不阻断直连：iroh 的打洞走「双方同时发包」\n"
+    } else {
+        "                   → 但这不阻断直连：rustp2p 的打洞同样走「双方同时发包」\n"
+    });
+    // 「未测到」与「不可用」是两回事 ——
+    // rustp2p 只观测到 IPv6 端口时，`public_ips` 与 `ipv6` 两个字段都是空的，
+    // 但端口范围有值说明 STUN 是通的。
+    let v4_mark = if p.udp_v4 {
+        "✅"
+    } else if p.port_range > 0 {
+        "未测到（端口范围已测得）"
+    } else {
+        "❌"
+    };
+    out.push_str(&format!(
+        " UDP 可用         : IPv4 {v4_mark}   IPv6 {}
+",
         if p.udp_v6 { "✅" } else { "❌" }
     ));
     out.push_str(&format!(" 端口映射         : {}\n", p.port_mapping.summary()));
     if p.port_mapping.is_unsupported() {
-        out.push_str(
-            "                   → 不影响：EIM 映射下内端口固定即端点稳定，打洞不依赖端口映射\n",
-        );
+        out.push_str(if is_iroh {
+            "                   → 不影响：EIM 映射下内端口固定即端点稳定，打洞不依赖端口映射\n"
+        } else {
+            "                   → 不影响打洞：rustp2p 靠端口预测 + 穷举，不需要路由器开端口映射\n"
+        });
+    }
+    if !is_iroh {
+        out.push_str(&format!(
+            " 对称端口范围     : {} 个端口（端口预测的候选空间）\n",
+            p.port_range
+        ));
+        if !p.mapping_udp.is_empty() {
+            out.push_str(&format!(
+                " 公网 UDP 映射     : {}\n",
+                p.mapping_udp.join(", ")
+            ));
+        }
     }
     if let Some(cp) = p.captive_portal {
         if cp {
@@ -150,24 +192,28 @@ pub fn render(report: &DiagReport) -> String {
     }
 
     out.push('\n');
-    out.push_str(&format!(
-        " 实际 home relay : {}\n",
-        match &p.home_relay {
-            Some(u) => u.to_string(),
-            None => "（未确定）".to_string(),
+    if is_iroh {
+        out.push_str(&format!(
+            " 实际 home relay : {}\n",
+            match &p.home_relay {
+                Some(u) => u.to_string(),
+                None => "（未确定）".to_string(),
+            }
+        ));
+        out.push_str(&format!(
+            " 探测最快中继     : {}\n",
+            match &p.preferred_relay {
+                Some(u) => u.to_string(),
+                None => "（未确定）".to_string(),
+            }
+        ));
+        for (url, latency) in &p.relay_latencies {
+            out.push_str(&format!("                     {url}  {}ms\n", latency.as_millis()));
         }
-    ));
-    out.push_str(&format!(
-        " 探测最快中继     : {}\n",
-        match &p.preferred_relay {
-            Some(u) => u.to_string(),
-            None => "（未确定）".to_string(),
-        }
-    ));
-    for (url, latency) in &p.relay_latencies {
-        out.push_str(&format!("                     {url}  {}ms\n", latency.as_millis()));
+        out.push_str("                   （探测有 5 秒总超时，未列出的中继不代表不可达）\n");
+    } else {
+        out.push_str(" 中继             : 自建 bootstrap（--bootstrap 指定），本机是公网机、不需要探测\n");
     }
-    out.push_str("                   （探测有 5 秒总超时，未列出的中继不代表不可达）\n");
 
     out.push('\n');
     out.push_str(&format!(" 判定: {}\n", v.headline));
