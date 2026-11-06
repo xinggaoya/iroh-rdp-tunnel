@@ -73,7 +73,13 @@ async fn run_rustp2p(cfg: ClientConfig) -> Result<()> {
         bootstrap: cfg.rustp2p.bootstrap.clone(),
         stun_servers: cfg.rustp2p.stun_servers.clone(),
         max_assistant_sockets: cfg.rustp2p.max_assistant_sockets,
-        punch_whitelist: None,
+        // **只对目标 peer 打洞**。
+        //
+        // rustp2p 默认对所有已知 peer 打洞，而 bootstrap 上往往还挂着
+        // 别的客户端实例。对称 NAT 的端口空间只有几万，被无关 peer
+        // 分掉之后，目标 peer 的端口预测就命中不了 —— 表现为
+        // 「打洞一直不成功」或「打洞成功了但 QUIC 握手仍超时」。
+        punch_whitelist: Some(vec![peer_id.clone()]),
         allow_list: Vec::new(),
     };
     let transport = Rustp2pTransport::build(

@@ -527,12 +527,13 @@ rustp2p ：[路径·client] ✅ 已切换到直连  107.172.191.12:2525  RTT 200
 [`docs/deploy/rustp2p-node-vps.md`](docs/deploy/rustp2p-node-vps.md)。
 
 ```powershell
-# 被控端
+# 被控端（peer id 固定；白名单列出控制端的 peer id）
 irt server --transport rustp2p --node-id my-server ^
+           --allow-peer my-client ^
            --bootstrap <VPS_IP>:6888
 
-# 控制端
-irt client --transport rustp2p --peer my-server ^
+# 控制端（peer id 固定）
+irt client --transport rustp2p --peer my-server --node-id my-client ^
            --bootstrap <VPS_IP>:6888
 ```
 
@@ -540,13 +541,42 @@ irt client --transport rustp2p --peer my-server ^
 > 被控端若写 `--bootstrap 127.0.0.1:6888`（因为节点就在本机），
 > 中继观测到的它的公网端点会是 `127.0.0.1:xxxxx` ⇒ 客户端永远打不到。
 
+> ⚠️ **控制端必须用固定 peer id，被控端的 `--allow-peer` 才能匹配上它**。
+>
+> `--allow-peer` 有**两重**作用，缺一不可：
+>
+> 1. **接入白名单**：被控端在 accept 层按 peer id 过滤入站流
+>    ⇒ 控制端的 peer id 必须与 `--allow-peer` 里写的**逐字相同**；
+> 2. **打洞白名单**：rustp2p-quic 只有在 `punch_allowed(src)` 为真时
+>    才回复 `PunchReply`，而对端正是靠这个 `PunchReply`
+>    来确认自己的直连路由 ⇒ **不在名单里 ⇒ 直连永远建不起来**。
+>
+> ⇒ 控制端 peer id 随机生成时，被控端的 `--allow-peer` 必然匹配不上
+> ⇒ **100% 握手超时**。所以要么两端都 `--node-id` 固定，
+> 要么被控端**不要**写 `--allow-peer`。
+>
+> 实测：被控端白名单=[clientZ] 而控制端是 clientZ2 ⇒ 握手超时；
+> 去掉被控端白名单 ⇒ **0.1 秒打通**，64KB 逐字节一致。
+
+> ⚠️ **打洞是双向协议**，两端必须同时向对方打才可能打通。rustp2p 默认
+> 会对 bootstrap 上**所有**已知 peer 打洞 —— 而那上面通常还挂着别的
+> 客户端实例，于是对称 NAT 的端口空间（实测 3~6 万）被瓜分，
+> 且打洞频率按 peer 分摊 ⇒ **目标 peer 永远打不通**。
+>
+> ⇒ 这正是**控制端**要把自己收敛到「只对目标 peer 打洞」的原因
+> （`irt client` 已经内置，无需任何参数）。
+>
+> 实测：不限定时 600 秒打不通；收敛后 **30 秒打通**，
+> 512KB 隧道逐字节一致、走直连 215ms。详见
+> [`docs/deploy/rustp2p-node-vps.md` §3.4](docs/deploy/rustp2p-node-vps.md)。
+
 **可用的环境变量**：`IRT_TRANSPORT` / `IRT_NODE_ID` / `IRT_PEER` /
-`IRT_BOOTSTRAP` / `IRT_STUN` / `IRT_ASSISTANT_SOCKETS`。
+`IRT_BOOTSTRAP` / `IRT_STUN` / `IRT_ASSISTANT_SOCKETS` / `IRT_ALLOW_PEERS`。
 
 #### rustp2p 的两个限制（务必知道）
 
 1. **打洞成功前连不上** —— 它的中继是协议层转发，QUIC 流仍需要已确认的路由。
-   实测打洞耗时可达 **4 分钟**（端口范围 3 万~6 万时）。
+   实测**配好白名单后**打洞约 **30 秒**；端口范围 3 万~6 万时可能更久。
    ⇒ **默认仍用 `--transport iroh` 保底**；需要低延迟时再切。
 2. **身份是降级的** —— `PeerId` 是任意字符串、证书校验被跳过，
    `--allow-peer` 只是**字符串比对，不是认证**。别把它暴露在不可信网络上。
@@ -583,7 +613,7 @@ irt diag --transport rustp2p
 | **一直显示「中继」，没有「✅ 已切换到直连」** | 1. 防火墙规则装了吗（**最常见原因**）<br>2. 跑 `irt diag` 看映射行为是不是 EIM<br>3. 中继延迟高（>150ms）？换一个更近的 relay：`irt server --relay https://aps1-1.relay.n0.iroh.link./`<br>4. 对端也在 NAT 后面？**双方都要能打洞** |
 | **首帧很慢，之后正常** | 打洞本身要几次往返，第一次连接会慢一些。第二次连接因为连接已建立会很快 |
 | **mstsc 报「无法连接到 127.0.0.1:13389」** | client 没运行；或端口被占用；或本机防火墙拦了本地回环 |
-| **rustp2p 后端连不上** | 1. 两端用的是**同一个公网** bootstrap 吗（被控端别写 `127.0.0.1`）<br>2. VPS 的端口在 1Panel 白名单里吗（tcp+udp 都要）—— 未放行会被**静默 DROP**<br>3. 打洞可能要几分钟，看 client 输出里「打开到 xxx 的双向流等待超过 30 秒」<br>4. 等不及就切回 `--transport iroh` 保底 |
+| **rustp2p 后端连不上** | 1. 两端用的是**同一个公网** bootstrap 吗（被控端别写 `127.0.0.1`）<br>2. VPS 的端口在 1Panel 白名单里吗（tcp+udp 都要）—— 未放行会被**静默 DROP**<br>3. **两端都用固定 peer id 了吗？被控端 `--allow-peer` 列出控制端 id 了吗？**（不限定 ⇒ bootstrap 上其它实例分走端口空间 ⇒ 永远打不通）<br>4. 打洞可能要几十秒，看 client 输出里「打开到 xxx 的双向流等待超过 30 秒」<br>5. 等不及就切回 `--transport iroh` 保底 |
 | **远端提示「本机 RDP 未在 127.0.0.1:3389 上运行」** | 被控端没启用 RDP：`reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f` |
 | **远程桌面提示账户密码错误** | RDP 要求**被控端本机账户** + 密码；某些家庭版 / 简化账户请改成 Microsoft 账户 |
 | **想禁止别人接入** | `irt server --allow <endpoint_id>`（可重复），或用 `IRT_ALLOW` 环境变量 |

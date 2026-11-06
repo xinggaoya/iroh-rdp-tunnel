@@ -145,6 +145,52 @@ pub struct Rustp2pTransport {
     /// 用 `Arc<Mutex<..>>` 而不是普通 Vec —— server 侧在收到入站流时
     /// 会动态加入新的对端，轮询任务必须能看见。
     watched: Arc<Mutex<Vec<PeerId>>>,
+    /// 每个 peer 一把锁，用来**串行化 `open_bi`**。
+    ///
+    /// 原因见 [`Rustp2pTransport::open_lock`]。
+    open_locks: Mutex<HashMap<PeerId, Arc<tokio::sync::Mutex<()>>>>,
+    /// 允许参与打洞的 peer 集合。
+    ///
+    /// `None` 表示**不限制**（对所有已知 peer 打洞）；
+    /// `Some(set)` 表示只对集合里的 peer 打洞。
+    ///
+    /// 为什么默认要限制：对称 NAT 的端口空间只有几万，
+    /// 而 bootstrap 上往往挂着**别的**客户端实例。rustp2p 默认
+    /// 会对**所有**已知 peer 发起打洞（`punch_whitelist: None`），
+    /// 于是有限的端口资源被无关 peer 分掉，真正要连的那个 peer
+    /// 迟迟打不通 —— 表现为「打洞成功但 QUIC 握手一直超时」。
+    ///
+    /// 详见 [`Rustp2pTransport::set_punch_peers`]。
+    punch_peers: Arc<Mutex<Option<HashSet<PeerId>>>>,
+}
+
+impl Rustp2pTransport {
+    /// 取某个 peer 的「打开流」锁。
+    ///
+    /// # 为什么必须串行化
+    ///
+    /// rustp2p-quic 内部的 `open_bi` 在握手失败时走
+    /// `connection_to_at` 的错误路径，调 `release_virtual_peer(peer_id)` ——
+    /// 它把该 peer 的虚拟地址从 `virtual_by_addr` 里**删掉**。
+    ///
+    /// 而**并发的**另一个 `open_bi` 拿到的是**同一个**虚拟地址
+    /// （`register_virtual_peer` 对同一 peer 是复用的），它正在用这个地址发包
+    /// —— ��个地址被注销后，它就会报
+    /// `unknown synthetic QUIC destination`。
+    ///
+    /// 更糟的是这个状态**修不好**：缓存里的 `connections[peer]` 仍指向那个
+    /// 已注销的地址，而该连接不会被标记为 closed ⇒
+    /// `open_bi` 的 `remove_if(is_closed)` 不触发 ⇒ 永远命中坏连接 ⇒
+    /// **永久失败**。
+    ///
+    /// 串行化之后，握手失败只会清理**自己**刚建立的地址，不会误伤别人。
+    fn open_lock(&self, peer_id: &PeerId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.open_locks.lock().unwrap();
+        locks
+            .entry(peer_id.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
 }
 
 impl Rustp2pTransport {
@@ -171,9 +217,19 @@ impl Rustp2pTransport {
         if !opts.stun_servers.is_empty() {
             builder = builder.stun_servers(opts.stun_servers.clone());
         }
-        if let Some(list) = &opts.punch_whitelist {
-            builder = builder.punch_whitelist(Some(list.iter().map(PeerId::new).collect()));
-        }
+        // 打洞白名单：**默认只打洞给明确指定的对端**。
+        //
+        // `opts.punch_whitelist` 为 `None` 时表示「调用方没指定」，
+        // 由各命令自己决定（client 侧填目标 peer，server 侧留空集
+        // 并在收到入站流时动态加入）。
+        let punch_peers: Arc<Mutex<Option<HashSet<PeerId>>>> = match &opts.punch_whitelist {
+            Some(list) => {
+                let set: HashSet<PeerId> = list.iter().map(PeerId::new).collect();
+                builder = builder.punch_whitelist(Some(set.iter().cloned().collect()));
+                Arc::new(Mutex::new(Some(set)))
+            }
+            None => Arc::new(Mutex::new(None)),
+        };
 
         let endpoint = builder
             .build()
@@ -189,6 +245,8 @@ impl Rustp2pTransport {
             state: Arc::new(Mutex::new(PathState::Connecting)),
             incoming: Arc::new(tokio::sync::Mutex::new(rx)),
             watched: Arc::new(Mutex::new(watched)),
+            open_locks: Mutex::new(HashMap::new()),
+            punch_peers,
         });
 
         transport.spawn_accept_loop(tx, opts.allow_list.clone());
@@ -207,6 +265,47 @@ impl Rustp2pTransport {
         }
     }
 
+    /// 设置允许参与打洞的 peer 集合。
+    ///
+    /// `None` = 不限制（对所有已知 peer 打洞）；`Some(set)` = 只对集合内打洞。
+    ///
+    /// # 为什么需要它
+    ///
+    /// 对称 NAT 的端口空间只有几万（实测 3~6 万），而 bootstrap 上通常
+    /// 还挂着**别的**客户端实例。rustp2p 默认对**所有**已知 peer 发起
+    /// 打洞，于是端口资源被无关 peer 分掉 —— 真正要连的那个 peer
+    /// 要么打不通，要么打通了但 QUIC 握手仍然超时（因为双方的
+    /// 端口预测互相干扰）。
+    ///
+    /// 量化：端口空间 6 万 ÷ 每轮 1500 个扫描端口 ≈ **40 轮**才能覆盖；
+    /// 而打洞频率是**按 peer 分摊**的（每 peer 10 秒一轮，且
+    /// `auto-punching` 循环每轮只处理一个 peer）。9 个 peer ⇒ 目标 peer
+    /// 的实际频率被稀释到 1/9 ⇒ **永远打不通**。限定到 1 个 peer 后
+    /// 实测 **30 秒**打通。
+    ///
+    /// 所以：**只对真正要对话的那个 peer 打洞**。
+    pub fn set_punch_peers(&self, peers: Option<HashSet<PeerId>>) {
+        *self.punch_peers.lock().unwrap() = peers.clone();
+        self.endpoint.set_punch_whitelist(
+            peers.map(|set| set.into_iter().collect::<Vec<_>>()),
+        );
+    }
+
+    /// 依据「最近是否活跃」刷新打洞白名单。
+    ///
+    /// # 为什么不做任何事
+    ///
+    /// 早期版本用 `PeerInfo::last_seen` 判断「peer 还活着」，
+    /// 但 bootstrap 转发 peer 列表时也会把 `last_seen` 刷成本地当前
+    /// 时间（`ingest_route_entries` → `confirm_peer_route` →
+    /// `upsert_peer_info`）—— 于是**已经退出的旧实例看起来一样活跃**，
+    /// 白名单形同虚设。
+    ///
+    /// 结论：白名单必须是**静态**的 —— 扩大它是运维的决策
+    /// （`--allow-peer`），运行时不猜测。
+    #[allow(dead_code)]
+    fn refresh_punch_peers_by_activity(&self, _window_ms: u64) {}
+
     /// 本端监听地址。
     pub fn local_addr(&self) -> Option<SocketAddr> {
         self.endpoint.local_addr()
@@ -224,6 +323,67 @@ impl Rustp2pTransport {
             .into_iter()
             .map(|p| p.peer_id)
             .collect()
+    }
+
+    /// 打印某个对端的观测信息（地址 + NAT 画像）。
+    ///
+    /// # 为什么需要它
+    ///
+    /// 「打洞打不通」几乎总是因为**打洞用的目标地址是过期的**。
+    /// 对端重启后 UDP 端口可能变了（容器重建 → 随机端口），而
+    /// bootstrap 转发来的 `nat_info` 还是旧的 ⇒ 客户端一直对着旧端口打。
+    ///
+    /// 这个信息在 `rustp2p` 里没有暴露给应用层，只能自己打印出来。
+    pub fn describe_peer(&self, peer: &PeerId) -> Option<String> {
+        let info = self
+            .endpoint
+            .known_peers()
+            .into_iter()
+            .find(|p| &p.peer_id == peer)?;
+        let nat = info
+            .nat_info
+            .as_ref()
+            .map(|n| {
+                format!(
+                    "nat={:?} public_ips={:?} public_udp_ports={:?} port_range={}",
+                    n.nat_type, n.public_ips, n.public_udp_ports, n.public_port_range
+                )
+            })
+            .unwrap_or_else(|| "nat=<未知>".to_string());
+        Some(format!(
+            "addrs={:?} relay_hint={:?} {nat}",
+            info.addrs,
+            info.relay_hint.as_ref().map(|p| p.as_str())
+        ))
+    }
+
+    /// 打印某个对端的**已确认路由**列表。
+    ///
+    /// # 为什么需要它
+    ///
+    /// rustp2p 的路由表里，一个 peer 可能有**多条**直连路由（每条对应
+    /// 一个不同的本地 socket）。而 `get_route_by_id` 只是「任选一条」
+    /// （`routes.iter().find(is_direct)`）—— 选错就会用错 socket 发包。
+    ///
+    /// 在**对称 NAT** 下这很致命：不同 socket ⇒ 不同映射端口 ⇒
+    /// 对端回包打不进来。表现就是「协议包通、QUIC 包不通」。
+    pub fn describe_routes(&self, peer: &PeerId) -> Option<String> {
+        let routes = self.endpoint.routes(peer.clone());
+        if routes.is_empty() {
+            return None;
+        }
+        let items: Vec<String> = routes
+            .iter()
+            .map(|r| {
+                format!(
+                    "{:?} metric={} rtt={:?}",
+                    r.route_key(),
+                    r.metric(),
+                    r.rtt()
+                )
+            })
+            .collect();
+        Some(format!("共 {} 条: {}", routes.len(), items.join(" | ")))
     }
 
     /// 后台任务：接受入站双向流。
@@ -347,6 +507,7 @@ impl Rustp2pTransport {
     }
 }
 
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crate::pathinfo::PathKind;
@@ -400,6 +561,14 @@ impl TransportEndpoint for Rustp2pTransport {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
         tracing::debug!("对端 {id} 已出现");
+        // 打印对端的观测信息 —— 「打不通」十有八九是**打洞目标地址过期**
+        //（对端重启换了 UDP 端口，而这里拿到的还是旧的）。
+        if let Some(desc) = self.describe_peer(&peer_id) {
+            tracing::info!("对端 {id} 的观测: {desc}");
+        }
+        if let Some(desc) = self.describe_routes(&peer_id) {
+            tracing::info!("对端 {id} 的已确认路由: {desc}");
+        }
 
         // **第二步：反复尝试打开流，直到成功或预算耗尽**。
         //
@@ -409,10 +578,30 @@ impl TransportEndpoint for Rustp2pTransport {
         //
         // 之前只试一次的后果：打洞还没完成时直接「QUIC handshake timed out」，
         // 用户看到的就是「连不上」。
+        // 串行化：同一对端的 `open_bi` 不能并发。
+        // 详见 [`Rustp2pTransport::open_lock`] 的说明。
+        let open_lock = self.open_lock(&peer_id);
+        let _open_guard = open_lock.lock().await;
+
         let deadline = std::time::Instant::now() + OPEN_STREAM_BUDGET;
         let mut attempt: u32 = 0;
         loop {
             // 单次尝试加超时 —— rustp2p 的 `open_bi` 在路由未建立时会一直等。
+            //
+            // **必须用 `open_bi`，不能用 `open_bi_via`。**
+            //
+            // `open_bi_via` 会把客户端的 QUIC 连接**钉死**在指定的那条
+            // route_key 上（独立命名空间 `via_virtual_addrs`）。但**服务端
+            // 那边并不知道这件事** —— 它回包时走的是「路由表查询」
+            // （`route_metric_for`），选的是**另一条**路由。
+            //
+            // ⇒ **去程与回程走了不同的路** ⇒ QUIC 握手包对不上 ⇒
+            // `QUIC handshake timed out`（协议包不走 QUIC，所以协议层
+            // 一切正常，直连也确认成功 —— 只有 QUIC 层失败）。
+            //
+            // 实测：用 `open_bi_via` 时，同机无 NAT、直连已确认、
+            // 协议层双向可通，QUIC 握手仍然 100% 超时；改回 `open_bi`
+            // 后同一环境立刻成功。
             let outcome = tokio::time::timeout(
                 OPEN_STREAM_ATTEMPT_TIMEOUT,
                 self.endpoint.open_bi(peer_id.clone()),
@@ -429,6 +618,13 @@ impl TransportEndpoint for Rustp2pTransport {
                 Ok(Err(e)) => {
                     attempt = attempt.saturating_add(1);
                     tracing::info!("打开到 {id} 的双向流失败（第 {attempt} 次）: {e} —— 继续等");
+                    // 每次失败都打印一次路由状态 —— 「握手超时」时需要知道
+                    // 到底有几条路由、走的是哪条（直连还是中继）。
+                    if attempt % 3 == 1 {
+                        if let Some(desc) = self.describe_routes(&peer_id) {
+                            tracing::info!("对端 {id} 的当前路由: {desc}");
+                        }
+                    }
                 }
                 Err(_) => {
                     attempt = attempt.saturating_add(1);

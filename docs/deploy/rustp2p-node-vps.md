@@ -194,6 +194,10 @@ irt client --transport rustp2p --peer vps-node \
 
 ### 3.3 完整隧道自检
 
+> ⚠️ **两端必须用固定 peer id，且被控端要用 `--allow-peer` 列出控制端的 peer id。**
+>
+> 这不是可选项 —— 见 §3.4。
+
 在一台机器上同时起被控端与控制端（本机自环，最快）：
 
 ```bash
@@ -211,16 +215,93 @@ def h(c):
 while True:
     c,_=s.accept(); threading.Thread(target=h,args=(c,),daemon=True).start()"
 
-# 终端 2：被控端
+# 终端 2：被控端（peer id 固定；白名单列出控制端）
 irt server --transport rustp2p --node-id local-a \
+           --allow-peer ctrl-a \
            --bootstrap <VPS_IP>:6888 --rdp 127.0.0.1:13389
 
-# 终端 3：控制端
-irt client --transport rustp2p --peer local-a \
+# 终端 3：控制端（peer id 固定）
+irt client --transport rustp2p --peer local-a --node-id ctrl-a \
            --bootstrap <VPS_IP>:6888 --listen 127.0.0.1:13390
 ```
 
 然后连 `127.0.0.1:13390`，数据应原样回显。
+
+---
+
+### 3.4 peer id 怎么定（**必读**）
+
+打洞是**双向协议**：双方必须**同时**向对方打，才可能打通。
+
+#### 3.4.1 为什么必须收敛打洞对象
+
+rustp2p 默认 `punch_whitelist: None` ⇒ 对 bootstrap 上**所有**已知 peer 打洞。
+而 bootstrap 上通常还挂着**别的客户端实例**（哪怕它们已经退出，peer 列表
+不会立刻清掉）。于是：
+
+1. 对称 NAT 的端口空间只有几万（实测 3~6 万）；
+2. `auto-punching` 循环**每轮只处理一个 peer**（每 peer 10 秒一轮）；
+3. 端口空间 6 万 ÷ 每轮 1500 个扫描端口 ≈ **40 轮**才覆盖一遍。
+
+⇒ 目标 peer 的实际打洞频率被稀释到 1/N，**永远打不通**。
+
+更糟的是**两端打的对象可能不一致**：一端只打 vps-peer，另一端却在给
+bootstrap 上的旧实例打洞 ⇒ 双方永远碰不上。
+
+**实测对比**（同一台客户端、同一台 VPS）：
+
+| 配置 | 结果 |
+|---|---|
+| 不限定（默认） | 打洞 600 秒仍未成功；隧道连不上 |
+| 控制端只对目标 peer 打洞 | **30 秒打通**；512KB 隧道逐字节一致，走直连 215ms |
+
+⇒ **控制端（`irt client`）已经内置了这个收敛**：它自动把打洞白名单
+设成「目标 peer」，不需要任何参数。
+
+#### 3.4.2 ⚠️ 被控端**不要**用 `--allow-peer` 做打洞白名单
+
+这是 v0.3 调试期踩得最狠的一个坑，**务必看完**。
+
+rustp2p-quic 的 `PunchRequest` 处理分支长这样（简化）：
+
+```rust
+if self.punch_allowed(&payload.src) {
+    self.try_execute_punch(...).await;
+    // 只有命中白名单，才回 PunchReply
+    self.send_protocol_to_route(src, route_key, ProtocolType::PunchReply, &reply).await?;
+} else {
+    log::debug!("PunchRequest from {src} ignored (not in whitelist)");
+}
+```
+
+而**对端正是靠这个 `PunchReply` 来确认自己的直连路由**（`PunchReply`
+分支里 `metric == 0` ⇒ `confirm_direct_and_promote`）。
+
+⇒ **只要对端不在白名单里，服务端就既不打洞、也不回 `PunchReply`
+⇒ 对端永远建不起直连 ⇒ QUIC 握手 100% 超时。**
+
+而控制端的 peer id **默认是随机生成的**（除非用 `--node-id` 固定），
+被控端根本无从预先知道 ⇒ **被控端一写 `--allow-peer` 就会把控制端挡在门外**。
+
+**实测**（同一台 VPS 上，两端都是本机）：
+
+| 被控端配置 | 控制端 peer id | 结果 |
+|---|---|---|
+| `--allow-peer clientZ` | `clientZ` | ✅ **0.1 秒打通**，64KB 逐字节一致 |
+| `--allow-peer clientZ` | `clientZ2` | ❌ 握手超时 |
+| 不写 `--allow-peer` | `clientZ2` | ✅ **0.1 秒打通** |
+
+#### 3.4.3 部署清单
+
+- **控制端**：`--peer <被控端 id>`（peer id 可以不固定，客户端会自己收敛打洞对象）
+- **被控端**：`--node-id <固定 id>`（固定！重启不变，否则控制端得改配置）
+- 两端的 `--bootstrap` 必须指向**同一个** VPS 的 `6888`
+- 被控端**默认不写** `--allow-peer`；只有在「控制端也用 `--node-id` 固定了
+  peer id」且确实要做接入管控时才写，且必须**逐字相同**
+- 被控端的 `--bind` 建议**固定端口**（容器重建换端口会让中继缓存的地址过期）
+
+> 注意：rustp2p 的被动打洞（响应对方 `PunchRequest`）**不检查白名单**，
+> 所以白名单只能限定「主动打洞」的对象。这也是为什么**控制端**必须限定。
 
 ---
 
@@ -262,6 +343,11 @@ cd /opt/rustp2p/deploy && docker compose build && docker compose up -d
 | 容器日志一片空白 | `println!` 到文件是块缓冲，进程不退出就不 flush | 加 `stdbuf -oL`（本项目用 entrypoint.sh 时不需要，容器 stdout 是行缓冲的） |
 | 打洞一直失败 | 对端 Windows 防火墙没放行入站 UDP | 对端执行 `irt client --install-firewall-rule` |
 | 直连要好几分钟 | 客户端 STUN 不通 ⇒ 拿不到端口范围 ⇒ 只能穷举 | 检查 UDP 3478 是否可达 |
+| **打洞 600 秒仍不成功，但两端都在打** | bootstrap 上挂着**已退出的旧客户端实例**；rustp2p 默认对所有 peer 打洞，对称 NAT 端口空间（3~6 万）被瓜分，且 `auto-punching` 每轮只处理一个 peer ⇒ 目标 peer 频率被稀释到 1/N | **控制端**收敛到只打目标 peer（已内置）。见 §3.4.1 |
+| **QUIC 握手一直超时，协议层却正常（能收到 `PunchRequest`）** | 被控端写了 `--allow-peer`，而控制端 peer id 随机生成 ⇒ 不在白名单 ⇒ 服务端**不回 `PunchReply`** ⇒ 控制端永远确认不了直连 | 去掉被控端的 `--allow-peer`；或让控制端用 `--node-id` 固定 peer id 并逐字匹配。见 §3.4.2 |
+| **直连确认了（`punch succeeded`），隧道仍超时** | 中继（node）缓存的对端 UDP 端口已过期（对端重启换了端口）⇒ 中继转发打向失效端口 | 被控端 `--bind` 固定端口；**部署/重启被控端时把 node 一起重启** |
+| **被控端报 `Failed to accept connection: timed out`** | 同上：客户端的 QUIC Initial 没到被控端 | 看客户端日志里「对端 … 的观测」，`public_udp_ports` 是否是当前端口 |
+| **打洞成功但 QUIC 握手一直超时** | 同上：端口被打到但路由表里选错了路 / 虚拟地址被并发 `open_bi` 释放 | 同上（白名单对齐后不再出现）；另见 `docs/superpowers/spike/rustp2p-e2e-result.md` |
 
 ---
 
