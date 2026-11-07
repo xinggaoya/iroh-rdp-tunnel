@@ -149,19 +149,6 @@ pub struct Rustp2pTransport {
     ///
     /// 原因见 [`Rustp2pTransport::open_lock`]。
     open_locks: Mutex<HashMap<PeerId, Arc<tokio::sync::Mutex<()>>>>,
-    /// 允许参与打洞的 peer 集合。
-    ///
-    /// `None` 表示**不限制**（对所有已知 peer 打洞）；
-    /// `Some(set)` 表示只对集合里的 peer 打洞。
-    ///
-    /// 为什么默认要限制：对称 NAT 的端口空间只有几万，
-    /// 而 bootstrap 上往往挂着**别的**客户端实例。rustp2p 默认
-    /// 会对**所有**已知 peer 发起打洞（`punch_whitelist: None`），
-    /// 于是有限的端口资源被无关 peer 分掉，真正要连的那个 peer
-    /// 迟迟打不通 —— 表现为「打洞成功但 QUIC 握手一直超时」。
-    ///
-    /// 详见 [`Rustp2pTransport::set_punch_peers`]。
-    punch_peers: Arc<Mutex<Option<HashSet<PeerId>>>>,
 }
 
 impl Rustp2pTransport {
@@ -217,19 +204,23 @@ impl Rustp2pTransport {
         if !opts.stun_servers.is_empty() {
             builder = builder.stun_servers(opts.stun_servers.clone());
         }
-        // 打洞白名单：**默认只打洞给明确指定的对端**。
+        // 打洞白名单。
         //
-        // `opts.punch_whitelist` 为 `None` 时表示「调用方没指定」，
-        // 由各命令自己决定（client 侧填目标 peer，server 侧留空集
-        // 并在收到入站流时动态加入）。
-        let punch_peers: Arc<Mutex<Option<HashSet<PeerId>>>> = match &opts.punch_whitelist {
-            Some(list) => {
-                let set: HashSet<PeerId> = list.iter().map(PeerId::new).collect();
-                builder = builder.punch_whitelist(Some(set.iter().cloned().collect()));
-                Arc::new(Mutex::new(Some(set)))
-            }
-            None => Arc::new(Mutex::new(None)),
-        };
+        // - `Some(list)` ⇒ 只对列表里的 peer 打洞。
+        //   **只有客户端会这么做** —— 客户端知道服务端的 peer id，
+        //   而对称 NAT 的端口空间只有几万，被 bootstrap 上的无关
+        //   peer 分掉之后，目标 peer 的端口预测就命中不了
+        //   （实测：不限时 600 秒打不通，限定后 30 秒打通）。
+        //
+        // - `None` ⇒ **不限制**（rustp2p 的默认行为）。
+        //   **服务端必须是这个** —— 见 DESIGN D30：rustp2p-quic 只有
+        //   在 `punch_allowed(src)` 为真时才回复 `PunchReply`，
+        //   而对端正是靠那个回复确认直连路由 ⇒ 服务端一限制，
+        //   匹配不上的客户端就永远建不起直连。
+        if let Some(list) = &opts.punch_whitelist {
+            let set: HashSet<PeerId> = list.iter().map(PeerId::new).collect();
+            builder = builder.punch_whitelist(Some(set.into_iter().collect()));
+        }
 
         let endpoint = builder
             .build()
@@ -246,7 +237,6 @@ impl Rustp2pTransport {
             incoming: Arc::new(tokio::sync::Mutex::new(rx)),
             watched: Arc::new(Mutex::new(watched)),
             open_locks: Mutex::new(HashMap::new()),
-            punch_peers,
         });
 
         transport.spawn_accept_loop(tx, opts.allow_list.clone());
@@ -284,27 +274,45 @@ impl Rustp2pTransport {
     /// 实测 **30 秒**打通。
     ///
     /// 所以：**只对真正要对话的那个 peer 打洞**。
+    /// 设置允许参与打洞的 peer 集合。
+    ///
+    /// `None` = **不限制**（对所有已知 peer 打洞）；
+    /// `Some(set)` = 只对集合里的 peer 打洞。
+    ///
+    /// # 为什么客户端要限制
+    ///
+    /// 对称 NAT 的端口空间只有几万（实测 3~6 万），而 bootstrap 上往往
+    /// 挂着**别的**客户端实例。rustp2p 默认会对**所有**已知 peer 发起
+    /// 打洞，于是有限的端口资源被无关 peer 分掉 —— 真正要连的那个 peer
+    /// 端口预测命中不了，表现为「一直打不通」或「打通了但握手仍超时」。
+    ///
+    /// # 为什么服务端**不能**限制
+    ///
+    /// 见 DESIGN D30：rustp2p-quic 只有在 `punch_allowed(src)` 为真时
+    /// 才回复 `PunchReply`，而对端正是靠那个回复确认自己的直连路由
+    /// ⇒ 服务端一限制，匹配不上的对端就永远建不起直连。
+    /// 而对端 peer id 默认随机生成，服务端根本无从预知 ⇒
+    /// **服务端必须保持 `None`**。
+    ///
+    /// # 真值只存一份
+    ///
+    /// 真值在 `endpoint` 里（`Endpoint::punch_whitelist`），
+    /// 这里不缓存副本 —— 两份状态迟早会对不上。
     pub fn set_punch_peers(&self, peers: Option<HashSet<PeerId>>) {
-        *self.punch_peers.lock().unwrap() = peers.clone();
         self.endpoint.set_punch_whitelist(
             peers.map(|set| set.into_iter().collect::<Vec<_>>()),
         );
     }
 
-    /// 依据「最近是否活跃」刷新打洞白名单。
+    /// 当前的打洞白名单。
     ///
-    /// # 为什么不做任何事
+    /// `None` = 不限制（对所有已知 peer 打洞）。
     ///
-    /// 早期版本用 `PeerInfo::last_seen` 判断「peer 还活着」，
-    /// 但 bootstrap 转发 peer 列表时也会把 `last_seen` 刷成本地当前
-    /// 时间（`ingest_route_entries` → `confirm_peer_route` →
-    /// `upsert_peer_info`）—— 于是**已经退出的旧实例看起来一样活跃**，
-    /// 白名单形同虚设。
-    ///
-    /// 结论：白名单必须是**静态**的 —— 扩大它是运维的决策
-    /// （`--allow-peer`），运行时不猜测。
-    #[allow(dead_code)]
-    fn refresh_punch_peers_by_activity(&self, _window_ms: u64) {}
+    /// 真值直接取自 rustp2p 端点，**不另存一份** ——
+    /// 两份状态迟早会对不上。
+    pub fn punch_whitelist(&self) -> Option<Vec<PeerId>> {
+        self.endpoint.punch_whitelist()
+    }
 
     /// 本端监听地址。
     pub fn local_addr(&self) -> Option<SocketAddr> {

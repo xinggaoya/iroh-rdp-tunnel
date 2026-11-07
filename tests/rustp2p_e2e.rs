@@ -49,6 +49,19 @@ async fn spawn_node(
     bootstrap: Vec<std::net::SocketAddr>,
     watched: Vec<PeerId>,
 ) -> std::sync::Arc<Rustp2pTransport> {
+    // 打洞白名单与关注的 peer 保持一致。
+    //
+    // **服务端侧必须传空**（`punch_whitelist: None`）—— 这正是
+    // DESIGN D30 的要求：rustp2p-quic 只有在白名单命中时才回复
+    // `PunchReply`，而对端靠那个回复确认直连路由 ⇒ 服务端一限制，
+    // 匹配不上的对端就永远建不起直连（实测 100% 握手超时）。
+    //
+    // 客户端侧则是「只打目标 peer」—— 与生产配置一致。
+    let punch_whitelist: Option<Vec<String>> = if peer_id == "server" {
+        None
+    } else {
+        Some(watched.iter().map(|p| p.as_str().to_string()).collect())
+    };
     Rustp2pTransport::build(
         &Rustp2pOptions {
             peer_id: peer_id.to_string(),
@@ -57,7 +70,7 @@ async fn spawn_node(
             bootstrap,
             stun_servers: Vec::new(),
             max_assistant_sockets: 2,
-            punch_whitelist: None,
+            punch_whitelist,
             allow_list: Vec::new(),
         },
         watched,
@@ -346,4 +359,63 @@ async fn rustp2p_concurrent_streams_to_same_peer() {
         assert_eq!(got, payload, "字节必须逐字节一致");
     }
     server_task.abort();
+}
+
+/// **锁定 DESIGN D30 的不变量**：打洞白名单的语义。
+///
+/// D30：rustp2p-quic 的 `PunchRequest` 分支里，只有 `punch_allowed(src)`
+/// 为真才会回复 `PunchReply` —— 而对端正是靠那个回复确认自己的直连路由。
+/// ⇒ **服务端一旦限制白名单，匹配不上的客户端就永远建不起直连**
+/// （实测：100% 握手超时），而客户端的 peer id 默认随机生成、
+/// 服务端根本无从预知。
+///
+/// ⇒ **服务端必须不限制（`None`）**，打洞收敛只能由**客户端**做
+/// （客户端知道服务端的 peer id）。
+///
+/// 这个测试把「`None` ⇒ 端点不限制、`Some` ⇒ 端点精确限定」钉死，
+/// 防止将来有人把服务端的 `--allow-peer` 又塞回 `punch_whitelist`。
+#[tokio::test]
+async fn punch_whitelist_semantics_are_explicit() {
+    // 服务端：不限制。
+    let server = spawn_node("server", vec![], vec![]).await;
+    assert_eq!(
+        server.punch_whitelist(),
+        None,
+        "服务端必须不限制打洞白名单 —— 限制会让匹配不上的客户端永远打不通"
+    );
+
+    // 客户端：只打目标 peer。
+    let client = Rustp2pTransport::build(
+        &Rustp2pOptions {
+            peer_id: "client".to_string(),
+            seed: b"client-seed".to_vec(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            bootstrap: Vec::new(),
+            stun_servers: Vec::new(),
+            max_assistant_sockets: 2,
+            punch_whitelist: Some(vec!["server".to_string()]),
+            allow_list: Vec::new(),
+        },
+        vec![],
+        "test",
+    )
+    .await
+    .expect("建立 rustp2p 节点失败");
+
+    let wl = client
+        .punch_whitelist()
+        .expect("客户端应限定了打洞白名单");
+    assert_eq!(
+        wl.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
+        vec!["server"],
+        "客户端应只对目标 peer 打洞"
+    );
+
+    // 运行时改白名单也要生效（供上层做动态收敛）。
+    client.set_punch_peers(None);
+    assert_eq!(
+        client.punch_whitelist(),
+        None,
+        "运行时取消限制应生效"
+    );
 }
